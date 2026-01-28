@@ -12,6 +12,18 @@
 //  - If the reference/contig is too long for full alignment, we align a mapped WINDOW instead
 //    (computed from the seed chain + padding), then lift SV coordinates back to global ref coords.
 //  - This preserves the same SV->graph behaviour as the small "test" example, but scales.
+//./fungi_pangenome \
+ // --ref ../multispecies_graph_sv/assemblies/rhizophagus_irregularis.fna \
+ // --asm-dir ../multispecies_graph_sv/test1/ \
+  //--out fungi_pan_rhizo1.gfa \
+  //--k 15 --s 9 --t 5 --w 2000 \
+  //--band 256 --band-cap 32768 \
+  //--mismatch 3 --gap-open 5 --gap-ext 1 \
+  //--sv 50 --seg 1000 \
+  //--top-contigs 50 --min-contig 50000 \
+  //--max-full-align 200000 \
+  //--window-pad 50000 \
+  //--max-ref-window 8000000
 //
 // NOTE: Still a prototype. For production pangenomes you'd want better mapping, split alignment,
 //       robust SV normalization, and proper allele graph construction.
