@@ -3,7 +3,8 @@
 AMF-style (arbuscular mycorrhizal fungi) *toy* genome simulator
 ==============================================================
 
-python test_amf.py --total-len 100000 --n-contigs 10 --n-genomes 1000 --outdir assemblies --manifest
+python test_amf.py --total-len 100000 --n-contigs 10 --n-genomes 4 --outdir assemblies --manifest
+
 Goal
 ----
 Generate small test genomes that *look AMF-like* in structure *without increasing total size*:
@@ -11,7 +12,6 @@ Generate small test genomes that *look AMF-like* in structure *without increasin
 - Multiple contigs (chromosome fragments) with repeat-enriched "subtelomeric-like" ends
 - Occasional low-complexity tracts
 - SVs (INS/DEL/DUP/INV/TRA) biased toward repeats/hotspots
-
 
 This is NOT a biological AMF genome generator; it's a *stress-test generator* for SV/graph tools.
 
@@ -207,14 +207,14 @@ class Event:
 def write_truth_tsv(path: str, truth: Sequence[Event]) -> None:
     header = ["asm","event_id","type","contig","pos","start","end","target_contig","target","length","extra"]
     with open(path, "w") as f:
-        f.write("\\t".join(header) + "\\n")
+        f.write("\t".join(header) + "\n")
         for ev in truth:
-            f.write("\\t".join([
+            f.write("\t".join([
                 ev.asm, str(ev.eid), ev.kind, ev.contig,
                 str(ev.pos), str(ev.start), str(ev.end),
                 ev.target_contig, str(ev.target), str(ev.length),
                 ev.extra
-            ]) + "\\n")
+            ]) + "\n")
 
 # ----------------------------
 # Hotspot sampling (biased to repeat-enriched ends)
@@ -530,7 +530,7 @@ def main() -> None:
     first = f"{args.prefix}{0:0{args.digits}d}"
     last = f"{args.prefix}{(args.n_genomes-1):0{args.digits}d}"
     print(f"  {os.path.join(args.outdir, first + '.fa')} ... {os.path.join(args.outdir, last + '.fa')}  (n={args.n_genomes})")
-    print(f"  {os.path.join(args.outdir, 'truth.tsv')}")
+    print(f"  {os.path.join(args.outdir, 'truth_all.tsv')}")
     if args.manifest:
         # Manifest includes per-assembly SV counts + compact positions + per-assembly truth path.
         # Per-assembly truth is written to: <outdir>/<asm>.truth.tsv
