@@ -1,6 +1,6 @@
 // main.cpp
 // Build: g++ -O3 -std=c++17 -pthread -o fungi_pangenome main.cpp
-// ./fungi_pangenome --ref ref.fa --asm-dir assemblies --out out.gfa --vcf out.vcf
+// ./fungi_pangenome --ref ref.fa --asm-dir assemblies --out out.gfa --vcf out.vcf --between-species --divergent-min-anchors-per-kb 0.25
 //
 // What this prototype does:
 //  - Builds a reference backbone graph (GFA) by segmenting the reference FASTA (all contigs).
@@ -1931,6 +1931,11 @@ struct Args {
     int window_pad = 20000;       // padding around chained seeds
     int max_ref_window = 6000000; // cap mapped ref window length (0=unlimited)
 
+    // Divergent / between-species mode: optionally fall back to full CONTIG-vs-CONTIG alignment
+    // when anchoring is weak (high divergence). Keeps syncmer+IVH mapping while improving INS/DEL.
+    bool between_species = false;
+    double divergent_min_anchors_per_kb = 0.25;
+
     // Interval hashing for repetitive seeds (mm2-ivh-inspired)
     bool use_ivh = true;
     int ivh_max_occ = 32;
@@ -2000,6 +2005,11 @@ static Args parse_args(int argc, char** argv) {
         else if (x == "--max-full-align") a.max_full_align = std::stoi(need(x));
         else if (x == "--window-pad") a.window_pad = std::stoi(need(x));
         else if (x == "--max-ref-window") a.max_ref_window = std::stoi(need(x));
+
+
+        else if (x == "--between-species") a.between_species = true;
+        else if (x == "--divergent-min-anchors-per-kb") a.divergent_min_anchors_per_kb = std::stod(need(x));
+
 
         else if (x == "--no-ivh") a.use_ivh = false;
         else if (x == "--ivh-max-occ") a.ivh_max_occ = std::stoi(need(x));
@@ -2272,16 +2282,44 @@ int main(int argc, char** argv) {
 
                 // Never try to align the entire concatenated genome backbone for huge refs/contigs.
                 // If too large, align a mapped WINDOW and lift coordinates.
-                bool use_full = ((int)qry_seq_full.size() <= args.max_full_align) &&
-                                ((args.max_ref_window == 0) || ((int)ref_concat.size() <= args.max_ref_window)) &&
-                                ((int)ref_concat.size() <= args.max_full_align);
+                //
+                // For highly divergent (between-species) comparisons, anchoring can be weak even when
+                // the true relationship is mostly collinear. In that case, optionally fall back to a
+                // full-length GLOBAL alignment between the QUERY contig and the chosen REFERENCE CONTIG
+                // (not the concatenated genome). This preserves scalability while improving single-base
+                // INS/DEL (and supports INV/DUP/TRA via the existing anchor/kmer logic).
+                double anchors_per_kb = (qry_seq_full.empty() ? 0.0 : (1000.0 * (double)chain.points.size() / (double)qry_seq_full.size()));
+                bool weak_anchoring = anchors_per_kb < args.divergent_min_anchors_per_kb;
 
-                if (use_full) {
+                bool use_full_concat = ((int)qry_seq_full.size() <= args.max_full_align) &&
+                                       ((args.max_ref_window == 0) || ((int)ref_concat.size() <= args.max_ref_window)) &&
+                                       ((int)ref_concat.size() <= args.max_full_align);
+
+                bool use_full_contig = false;
+                if (args.between_species && weak_anchoring && chosen_cid != (size_t)-1 && chosen_cid < ref_infos.size()) {
+                    const auto& ci = ref_infos[chosen_cid];
+                    if ((int)qry_seq_full.size() <= args.max_full_align && (int)ci.len <= args.max_full_align) {
+                        use_full_contig = true;
+                    }
+                }
+
+                if (use_full_concat) {
                     ref_sub = ref_concat;
                     qry_sub = qry_seq_full;
                     ref_sub_global0 = 0;
                     qry_sub0 = 0;
                     chain_local = chain; // already in same coordinate system
+                } else if (use_full_contig) {
+                    const auto& ci = ref_infos[chosen_cid];
+                    ref_sub_global0 = ci.start_global;
+                    qry_sub0 = 0;
+                    ref_sub = ref_concat.substr(ci.start_global, ci.len);
+                    qry_sub = qry_seq_full;
+                    // shift chain into contig-local coordinates (clip to contig and full query)
+                    chain_local = shift_and_clip_chain(chain, ci.start_global, ci.start_global + ci.len,
+                                                       0, (uint32_t)qry_seq_full.size());
+                    std::cerr << "    [info] Between-species fallback: full contig-vs-contig alignment (anchors_per_kb="
+                              << anchors_per_kb << ")\n";
                 } else {
                     Window win;
                     bool ok = compute_mapped_window(chain, args.k,
@@ -2617,4 +2655,3 @@ add_sv_to_graph(g, sample, ev.ref_contig1, contig.name, ev.ref_pos, ev, args.ref
         return 1;
     }
 }
-
