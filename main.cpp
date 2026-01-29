@@ -1,5 +1,6 @@
 // main.cpp
 // Build: g++ -O3 -std=c++17 -pthread -o fungi_pangenome main.cpp
+// ./fungi_pangenome --ref ref.fa --asm-dir assemblies --out out.gfa --vcf out.vcf
 //
 // What this prototype does:
 //  - Builds a reference backbone graph (GFA) by segmenting the reference FASTA (all contigs).
@@ -12,18 +13,6 @@
 //  - If the reference/contig is too long for full alignment, we align a mapped WINDOW instead
 //    (computed from the seed chain + padding), then lift SV coordinates back to global ref coords.
 //  - This preserves the same SV->graph behaviour as the small "test" example, but scales.
-//./fungi_pangenome \
- // --ref ../multispecies_graph_sv/assemblies/rhizophagus_irregularis.fna \
- // --asm-dir ../multispecies_graph_sv/test1/ \
-  //--out fungi_pan_rhizo1.gfa \
-  //--k 15 --s 9 --t 5 --w 2000 \
-  //--band 256 --band-cap 32768 \
-  //--mismatch 3 --gap-open 5 --gap-ext 1 \
-  //--sv 50 --seg 1000 \
-  //--top-contigs 50 --min-contig 50000 \
-  //--max-full-align 200000 \
-  //--window-pad 50000 \
-  //--max-ref-window 8000000
 //
 // NOTE: Still a prototype. For production pangenomes you'd want better mapping, split alignment,
 //       robust SV normalization, and proper allele graph construction.
@@ -119,6 +108,51 @@ static inline uint64_t splitmix64(uint64_t x) {
     return x ^ (x >> 31);
 }
 
+
+static inline uint64_t mix64(uint64_t a, uint64_t b) {
+    return splitmix64(a ^ splitmix64(b + 0x9e3779b97f4a7c15ULL));
+}
+
+static inline uint64_t ivh_signature_from_positions(
+    const std::vector<uint32_t>& occ,
+    size_t i,
+    int wing,
+    uint32_t gap_cap)
+{
+    std::vector<uint32_t> gaps;
+    gaps.reserve((size_t)wing * 2);
+
+    auto cap = [&](uint32_t g) { return std::min<uint32_t>(g, gap_cap); };
+
+    for (int w = 1; w <= wing; w++) {
+        if (i < (size_t)w) break;
+        gaps.push_back(cap(occ[i] - occ[i - (size_t)w]));
+    }
+    for (int w = 1; w <= wing; w++) {
+        size_t j = i + (size_t)w;
+        if (j >= occ.size()) break;
+        gaps.push_back(cap(occ[j] - occ[i]));
+    }
+
+    uint32_t unit = 1;
+    if (!gaps.empty()) {
+        unit = gap_cap;
+        for (uint32_t g : gaps) if (g > 0) unit = std::min(unit, g);
+        if (unit == 0 || unit == gap_cap) unit = 1;
+    }
+
+    uint64_t pack = 0;
+    int shift = 0;
+    for (uint32_t g : gaps) {
+        uint32_t ng = (uint32_t)std::min<uint64_t>(31ULL, (uint64_t)(g / unit));
+        pack |= (uint64_t)(ng & 31U) << shift;
+        shift += 5;
+        if (shift >= 60) break;
+    }
+    pack ^= (uint64_t)std::min<size_t>(occ.size(), 1023ULL) << 50;
+    return splitmix64(pack);
+}
+
 static inline uint64_t hash_kmer(const std::string& s, size_t pos, int k) {
     uint64_t x = 0;
     for (int i = 0; i < k; i++) {
@@ -173,12 +207,20 @@ static std::vector<Syncmer> compute_syncmers(
 // ---------------- Reference index (bucketed, on concatenated ref) ----------------
 struct RefIndex {
     int interval_w = 2000;
-    // bucket -> hash -> list of global positions in concatenated ref
-    std::unordered_map<uint32_t, std::unordered_map<uint64_t, std::vector<uint32_t>>> buckets;
+
+    struct Bucket {
+        std::unordered_map<uint64_t, std::vector<uint32_t>> normal;
+        std::unordered_map<uint64_t, std::vector<uint32_t>> ivh;
+        std::unordered_set<uint64_t> frequent;
+    };
+
+    std::unordered_map<uint32_t, Bucket> buckets;
 };
 
+
 static RefIndex build_ref_index(
-    const std::string& refseq_concat, int k, int smer, int t, int interval_w)
+    const std::string& refseq_concat, int k, int smer, int t, int interval_w,
+    bool use_ivh, int ivh_max_occ, int ivh_wing, uint32_t ivh_gap_cap)
 {
     RefIndex idx;
     idx.interval_w = interval_w;
@@ -187,9 +229,40 @@ static RefIndex build_ref_index(
 
     for (const auto& sm : syncs) {
         uint32_t b = sm.pos / (uint32_t)interval_w;
-        idx.buckets[b][sm.h].push_back(sm.pos);
+        idx.buckets[b].normal[sm.h].push_back(sm.pos);
     }
+
+    if (use_ivh) {
+        for (auto& kvb : idx.buckets) {
+            auto& B = kvb.second;
+            for (auto& kv : B.normal) {
+                auto& occ = kv.second;
+                if (occ.size() >= 2) std::sort(occ.begin(), occ.end());
+            }
+
+            std::vector<uint64_t> to_move;
+            for (const auto& kv : B.normal) {
+                if ((int)kv.second.size() > ivh_max_occ) to_move.push_back(kv.first);
+            }
+
+            for (uint64_t h : to_move) {
+                auto it = B.normal.find(h);
+                if (it == B.normal.end()) continue;
+                auto& occ = it->second;
+
+                B.frequent.insert(h);
+                for (size_t i = 0; i < occ.size(); i++) {
+                    uint64_t sig = ivh_signature_from_positions(occ, i, ivh_wing, ivh_gap_cap);
+                    uint64_t key = mix64(h, sig);
+                    B.ivh[key].push_back(occ[i]);
+                }
+                B.normal.erase(it);
+            }
+        }
+    }
+
     return idx;
+
 }
 
 // ---------------- Seeding ----------------
@@ -200,24 +273,53 @@ static std::vector<SeedPair> find_seed_pairs(
     const RefIndex& ridx,
     int k, int smer, int t,
     int interval_w,
+    bool use_ivh, int ivh_wing, uint32_t ivh_gap_cap,
     int max_buckets_scan = 2)
 {
     std::vector<SeedPair> seeds;
     auto qsyncs = compute_syncmers(qry, k, smer, t);
     seeds.reserve(qsyncs.size() * 2);
 
+    std::unordered_map<uint64_t, std::vector<uint32_t>> qocc;
+    if (use_ivh) {
+        qocc.reserve(qsyncs.size() / 4 + 1);
+        for (const auto& qs : qsyncs) qocc[qs.h].push_back(qs.pos);
+        for (auto& kv : qocc) std::sort(kv.second.begin(), kv.second.end());
+    }
+
+    auto qpos_index = [&](const std::vector<uint32_t>& occ, uint32_t pos) -> size_t {
+        auto it = std::lower_bound(occ.begin(), occ.end(), pos);
+        if (it == occ.end()) return occ.size() ? (occ.size() - 1) : 0;
+        return (size_t)std::distance(occ.begin(), it);
+    };
+
     for (const auto& qs : qsyncs) {
         uint32_t qb = qs.pos / (uint32_t)interval_w;
+
         for (int delta = -max_buckets_scan; delta <= max_buckets_scan; delta++) {
             int64_t b = (int64_t)qb + delta;
             if (b < 0) continue;
+
             auto itb = ridx.buckets.find((uint32_t)b);
             if (itb == ridx.buckets.end()) continue;
+            const auto& B = itb->second;
 
-            auto ith = itb->second.find(qs.h);
-            if (ith == itb->second.end()) continue;
+            if (use_ivh && B.frequent.find(qs.h) != B.frequent.end()) {
+                auto itq = qocc.find(qs.h);
+                if (itq == qocc.end() || itq->second.size() < 2) continue;
 
-            for (uint32_t rp : ith->second) seeds.push_back({qs.pos, rp});
+                size_t iocc = qpos_index(itq->second, qs.pos);
+                uint64_t sig = ivh_signature_from_positions(itq->second, iocc, ivh_wing, ivh_gap_cap);
+                uint64_t key = mix64(qs.h, sig);
+
+                auto ith = B.ivh.find(key);
+                if (ith == B.ivh.end()) continue;
+                for (uint32_t rp : ith->second) seeds.push_back({qs.pos, rp});
+            } else {
+                auto ith = B.normal.find(qs.h);
+                if (ith == B.normal.end()) continue;
+                for (uint32_t rp : ith->second) seeds.push_back({qs.pos, rp});
+            }
         }
     }
 
@@ -667,6 +769,8 @@ static AlignmentResult align_by_anchors(
 }
 
 // ---------------- SV extraction ----------------
+
+
 struct SVEvent {
     // Local position (within the reference contig) of the breakpoint / start of event.
     uint32_t ref_pos = 0;
@@ -677,6 +781,9 @@ struct SVEvent {
     //   TRA        : inferred from k-mer block mapping (source contig -> target contig jump)
     std::string type;       // INS / DEL / DUP / INV / TRA
 
+
+    // Optional annotations (TE/HGT/Starship candidates; set when known)
+    std::string annot;
     // For INS/DUP/INV we store the alternative allele sequence (for INV it is stored as reverse-complement).
     // For DEL/TRA this is "*".
     std::string allele_seq = "*";
@@ -691,6 +798,58 @@ struct SVEvent {
     char orient1 = '+';      // '+' or '-'
     char orient2 = '+';
 };
+
+
+static inline void annotate_mobile_like_sv(SVEvent& ev, const std::string& ref_ctx) {
+    if (ev.type != "INS" && ev.type != "DUP") return;
+    if (ev.allele_seq == "*" || ev.allele_seq.empty()) return;
+
+    const uint32_t L = ev.len;
+    if (L >= 50000) {
+        if (!ev.annot.empty()) ev.annot += ";";
+        ev.annot += "STARSHIP_CAND";
+    }
+
+    auto gc_frac = [](const std::string& s) -> double {
+        if (s.empty()) return 0.0;
+        uint64_t gc = 0, n = 0;
+        for (char c : s) {
+            char u = (char)std::toupper((unsigned char)c);
+            if (u=='A'||u=='C'||u=='G'||u=='T') { n++; if (u=='G'||u=='C') gc++; }
+        }
+        return n ? (double)gc / (double)n : 0.0;
+    };
+
+    double gc_alt = gc_frac(ev.allele_seq);
+    double gc_ref = gc_frac(ref_ctx);
+    if (L >= 2000 && std::abs(gc_alt - gc_ref) >= 0.15) {
+        if (!ev.annot.empty()) ev.annot += ";";
+        ev.annot += "HGT_CAND";
+    }
+
+    if (L >= 100 && L <= 30000) {
+        auto revcomp = [](const std::string& s) {
+            std::string r; r.reserve(s.size());
+            for (auto it=s.rbegin(); it!=s.rend(); ++it) {
+                char u=(char)std::toupper((unsigned char)*it);
+                char c='N';
+                if (u=='A') c='T'; else if (u=='C') c='G'; else if (u=='G') c='C'; else if (u=='T') c='A';
+                r.push_back(c);
+            }
+            return r;
+        };
+        size_t w = std::min<size_t>(20, ev.allele_seq.size());
+        std::string left = ev.allele_seq.substr(0, w);
+        std::string right = ev.allele_seq.substr(ev.allele_seq.size()-w, w);
+        std::string rc_right = revcomp(right);
+        int match = 0;
+        for (size_t i=0;i<w;i++) if (left[i]==rc_right[i]) match++;
+        if (w >= 12 && match >= (int)(0.75*w)) {
+            if (!ev.annot.empty()) ev.annot += ";";
+            ev.annot += "TE_CAND";
+        }
+    }
+}
 
 static std::vector<SVEvent> extract_svs_from_cigar(
     const std::string& ref,
@@ -717,6 +876,146 @@ static std::vector<SVEvent> extract_svs_from_cigar(
         }
     }
     return svs;
+}
+
+static std::vector<SVEvent> extract_svs_from_anchors(
+    const std::string& ref_sub,
+    const std::string& qry_sub,
+    const Chain& chain_local,
+    int k,
+    uint32_t sv_min_len,
+    int flank_anchors,
+    bool call_head_tail)
+{
+    std::vector<SVEvent> svs;
+    if (chain_local.points.empty()) return svs;
+
+    // Estimate typical anchor-to-anchor noise and require SV gaps to exceed it.
+    std::vector<uint32_t> diffs;
+    diffs.reserve(chain_local.points.size());
+    for (size_t i = 1; i < chain_local.points.size(); i++) {
+        const auto& p = chain_local.points[i - 1];
+        const auto& a = chain_local.points[i];
+        uint32_t pr = p.rpos + (uint32_t)k;
+        uint32_t pq = p.qpos + (uint32_t)k;
+        if (a.rpos < pr || a.qpos < pq) continue;
+        uint32_t r_gap = a.rpos - pr;
+        uint32_t q_gap = a.qpos - pq;
+        uint32_t d = (r_gap > q_gap) ? (r_gap - q_gap) : (q_gap - r_gap);
+        if (d > 0) diffs.push_back(d);
+    }
+    uint32_t noise = 0;
+    if (!diffs.empty()) {
+        std::nth_element(diffs.begin(), diffs.begin() + diffs.size()/2, diffs.end());
+        noise = diffs[diffs.size()/2];
+    }
+    uint32_t noise_cap = std::min<uint32_t>(noise, 50);
+    uint32_t min_sv = std::max<uint32_t>(sv_min_len, 3 * noise_cap);
+
+    auto add_ins = [&](uint32_t ref_pos, uint32_t qpos, uint32_t len) {
+        if (len < min_sv) return;
+        if ((size_t)qpos + (size_t)len > qry_sub.size()) return;
+        SVEvent ev; ev.ref_pos = ref_pos; ev.type = "INS"; ev.len = len;
+        ev.allele_seq = qry_sub.substr(qpos, (size_t)len);
+        svs.push_back(std::move(ev));
+    };
+    auto add_del = [&](uint32_t ref_pos, uint32_t len) {
+        if (len < min_sv) return;
+        SVEvent ev; ev.ref_pos = ref_pos; ev.type = "DEL"; ev.len = len;
+        ev.allele_seq = "*";
+        svs.push_back(std::move(ev));
+    };
+
+    if (call_head_tail) {
+        const auto& a0 = chain_local.points.front();
+        uint32_t r_gap = a0.rpos;
+        uint32_t q_gap = a0.qpos;
+        if (q_gap > r_gap) add_ins(0, 0, q_gap - r_gap);
+        else if (r_gap > q_gap) add_del(0, r_gap - q_gap);
+    }
+
+    for (size_t i = 1; i < chain_local.points.size(); i++) {
+        if ((int)i < flank_anchors) continue;
+        if ((int)(chain_local.points.size() - i) < flank_anchors) continue;
+
+        const auto& p = chain_local.points[i - 1];
+        const auto& a = chain_local.points[i];
+        uint32_t pr = p.rpos + (uint32_t)k;
+        uint32_t pq = p.qpos + (uint32_t)k;
+        if (a.rpos < pr || a.qpos < pq) continue;
+
+        uint32_t r_gap = a.rpos - pr;
+        uint32_t q_gap = a.qpos - pq;
+        if (q_gap > r_gap) add_ins(pr, pq, q_gap - r_gap);
+        else if (r_gap > q_gap) add_del(pr, r_gap - q_gap);
+    }
+
+    if (call_head_tail) {
+        const auto& al = chain_local.points.back();
+        uint32_t pr = al.rpos + (uint32_t)k;
+        uint32_t pq = al.qpos + (uint32_t)k;
+        if (pr <= (uint32_t)ref_sub.size() && pq <= (uint32_t)qry_sub.size()) {
+            uint32_t r_gap = (uint32_t)ref_sub.size() - pr;
+            uint32_t q_gap = (uint32_t)qry_sub.size() - pq;
+            if (q_gap > r_gap) add_ins(pr, pq, q_gap - r_gap);
+            else if (r_gap > q_gap) add_del(pr, r_gap - q_gap);
+        }
+    }
+
+    return svs;
+}
+
+static void dedup_ins_del(std::vector<SVEvent>& svs, uint32_t pos_tol=50, double len_tol=0.35) {
+    std::vector<SVEvent> out;
+    out.reserve(svs.size());
+    auto similar = [&](const SVEvent& a, const SVEvent& b) {
+        if (a.type != b.type) return false;
+        if (a.type != "INS" && a.type != "DEL") return false;
+        uint32_t dx = (a.ref_pos > b.ref_pos) ? (a.ref_pos - b.ref_pos) : (b.ref_pos - a.ref_pos);
+        if (dx > pos_tol) return false;
+        if (a.len == 0 || b.len == 0) return false;
+        double lo = (double)a.len * (1.0 - len_tol);
+        double hi = (double)a.len * (1.0 + len_tol);
+        return (double)b.len >= lo && (double)b.len <= hi;
+    };
+    for (const auto& ev : svs) {
+        bool dup=false;
+        for (const auto& kept : out) {
+            if (similar(ev, kept)) { dup=true; break; }
+        }
+        if (!dup) out.push_back(ev);
+    }
+    svs.swap(out);
+}
+
+static std::vector<SVEvent> intersect_indels_supported(
+    const std::vector<SVEvent>& a,
+    const std::vector<SVEvent>& b,
+    uint32_t pos_tol = 120,
+    double len_tol = 0.4)
+{
+    std::vector<SVEvent> out;
+    auto match = [&](const SVEvent& x, const SVEvent& y)->bool{
+        if (x.type != y.type) return false;
+        if (x.type != "INS" && x.type != "DEL") return false;
+        uint32_t dx = (x.ref_pos > y.ref_pos) ? (x.ref_pos - y.ref_pos) : (y.ref_pos - x.ref_pos);
+        if (dx > pos_tol) return false;
+        if (x.len==0 || y.len==0) return false;
+        double lo = (double)x.len*(1.0-len_tol);
+        double hi = (double)x.len*(1.0+len_tol);
+        return (double)y.len>=lo && (double)y.len<=hi;
+    };
+    for (const auto& x: a){
+        for (const auto& y: b){
+            if (match(x,y)){ out.push_back(x); break; }
+        }
+    }
+    for (const auto& y: b){
+        for (const auto& x: a){
+            if (match(y,x)){ out.push_back(y); break; }
+        }
+    }
+    return out;
 }
 
 // ---------------- Simple GFA graph ----------------
@@ -900,6 +1199,21 @@ struct RefContigInfo {
     uint32_t start_global = 0; // start position in concatenated reference
     uint32_t len = 0;
 };
+
+static std::vector<SeedPair> filter_seeds_to_refcontig(const std::vector<SeedPair>& seeds,
+                                                       const std::vector<RefContigInfo>& ref_infos,
+                                                       size_t ref_cid)
+{
+    std::vector<SeedPair> out;
+    if (ref_cid >= ref_infos.size()) return out;
+    uint32_t s = ref_infos[ref_cid].start_global;
+    uint32_t e = s + ref_infos[ref_cid].len;
+    out.reserve(seeds.size());
+    for (const auto& sp : seeds) {
+        if (sp.rpos >= s && sp.rpos < e) out.push_back(sp);
+    }
+    return out;
+}
 
 static bool global_to_contig(const std::vector<RefContigInfo>& infos,
                              uint32_t pos_global,
@@ -1136,9 +1450,7 @@ static std::vector<SVEvent> infer_dup_inv_tra_from_blocks(const std::string& qry
         });
 
         const uint32_t MERGE_GAP = 200;   // bp tolerance to merge adjacent blocks
-        // Minimum inversion length. This removes short spurious "-" blocks that typically
-        // come from local repeats/noise and inflate the SV count.
-        const uint32_t MIN_SPAN = 800;
+        const uint32_t MIN_SPAN = 0;      // already enforced upstream
 
         uint32_t mq0=invs[0].q0, mq1=invs[0].q1;
         uint32_t mr0=invs[0].r0, mr1=invs[0].r1;
@@ -1206,41 +1518,25 @@ static std::vector<SVEvent> infer_dup_inv_tra_from_blocks(const std::string& qry
         // Breakpoint at end of A on source contig
         uint32_t bp = A.r1l;
 
-        // Determine if DUP-like: B overlaps any earlier visited interval.
-        // Important: a transposed duplication usually involves a big reference jump; we
-        // must prefer DUP over TRA when overlap evidence is present.
+        // Determine if TRA-like jump
+        bool is_tra = false;
+        if (A.contig != B.contig) {
+            is_tra = true;
+        } else {
+            uint32_t jump = (B.r0l > A.r1l) ? (B.r0l - A.r1l) : (A.r1l - B.r0l);
+            if (jump >= tra_min_dist) is_tra = true;
+        }
+
+        // Determine if DUP-like: B overlaps any earlier visited interval (excluding itself)
         bool is_dup = false;
+        // Include the immediately previous interval as well (common tandem-dup pattern).
         for (size_t v = 0; v < visited.size(); v++) {
             if (visited[v].contig != B.contig) continue;
             uint32_t ov = overlap_len(visited[v].a0, visited[v].a1, B.r0l, B.r1l);
             if (ov >= min_dup_ovl) { is_dup = true; break; }
         }
 
-        // Determine if TRA-like jump (only if not a duplication)
-        bool is_tra = false;
-        if (!is_dup) {
-            if (A.contig != B.contig) {
-                is_tra = true;
-            } else {
-                uint32_t jump = (B.r0l > A.r1l) ? (B.r0l - A.r1l) : (A.r1l - B.r0l);
-                if (jump >= tra_min_dist) is_tra = true;
-            }
-        }
-
-        if (is_dup) {
-            SVEvent ev;
-            ev.type = "DUP";
-            ev.ref_contig1 = A.contig;
-            ev.ref_pos = bp;
-            // Use the *reference* span of the duplicated block as DUP length. Using query span can
-            // substantially overestimate DUP size when the block covers multiple nearby events.
-            ev.len = (B.r1l > B.r0l) ? (B.r1l - B.r0l) : 0;
-            size_t take = std::min<size_t>(ev.len, (B.b.q1 > B.b.q0) ? (B.b.q1 - B.b.q0) : 0);
-            if (take > 0 && B.b.q0 < qry.size()) {
-                ev.allele_seq = qry.substr(B.b.q0, std::min(take, qry.size() - (size_t)B.b.q0));
-            }
-            out.push_back(std::move(ev));
-        } else if (is_tra) {
+        if (is_tra) {
             SVEvent ev;
             ev.type = "TRA";
             ev.ref_contig1 = A.contig;
@@ -1251,6 +1547,14 @@ static std::vector<SVEvent> infer_dup_inv_tra_from_blocks(const std::string& qry
             ev.allele_seq = "*";
             ev.orient1 = '+';
             ev.orient2 = '+';
+            out.push_back(std::move(ev));
+        } else if (is_dup) {
+            SVEvent ev;
+            ev.type = "DUP";
+            ev.ref_contig1 = A.contig;
+            ev.ref_pos = bp;
+            ev.len = (B.b.q1 > B.b.q0) ? (B.b.q1 - B.b.q0) : 0;
+            ev.allele_seq = qry.substr(B.b.q0, std::min<size_t>(ev.len, qry.size() - B.b.q0));
             out.push_back(std::move(ev));
         }
     }
@@ -1277,20 +1581,11 @@ static std::vector<SVEvent> dedup_svs(std::vector<SVEvent> evs,
 
     for (auto& e : evs) {
         std::ostringstream key;
-        // For intra-contig TRA, treat the two breakpoints as an undirected pair.
-        // This merges A->B and B->A representations of the same transposition.
-        if (e.type == "TRA" && e.ref_contig1 == e.ref_contig2) {
-            uint32_t a = bin(e.ref_pos, pos_bin);
-            uint32_t b = bin(e.ref_pos2, pos_bin);
-            if (b < a) std::swap(a, b);
-            key << "TRA|" << e.ref_contig1 << ":" << a << "-" << b;
-        } else {
-            key << e.type << "|"
-                << e.ref_contig1 << ":" << bin(e.ref_pos, pos_bin) << "|"
-                << "l" << bin(e.len, len_bin);
-            if (e.type == "TRA") {
-                key << "|to:" << e.ref_contig2 << ":" << bin(e.ref_pos2, pos_bin);
-            }
+        key << e.type << "|"
+            << e.ref_contig1 << ":" << bin(e.ref_pos, pos_bin) << "|"
+            << "l" << bin(e.len, len_bin);
+        if (e.type == "TRA") {
+            key << "|to:" << e.ref_contig2 << ":" << bin(e.ref_pos2, pos_bin);
         }
         std::string k = key.str();
         if (seen.insert(k).second) out.push_back(std::move(e));
@@ -1482,6 +1777,8 @@ struct Args {
     std::string ref_path;
     std::vector<std::string> asm_dirs;
     std::string out_gfa = "pangenome.gfa";
+    std::string out_vcf;
+
 
     int k = 15;
     int s = 9;
@@ -1496,6 +1793,11 @@ struct Args {
     int gap_ext  = 1;
 
     int sv_min = 50;
+    int sv_min_indel = 200; // minimum INS/DEL length (reduces overcalling)
+    int flank_anchors = 8; // anchors required on each side for anchor-gap indels
+    int min_chain_points = 15; // skip SV calling if fewer anchors
+    bool call_head_tail_indels = false; // head/tail indels are often artifacts
+
     int ref_segment = 1000;
 
     bool recursive = true;
@@ -1511,6 +1813,12 @@ struct Args {
     // Window extraction for big genomes
     int window_pad = 20000;       // padding around chained seeds
     int max_ref_window = 6000000; // cap mapped ref window length (0=unlimited)
+
+    // Interval hashing for repetitive seeds (mm2-ivh-inspired)
+    bool use_ivh = true;
+    int ivh_max_occ = 32;
+    int ivh_wing = 2;
+    uint32_t ivh_gap_cap = 4000;
 };
 
 static void usage() {
@@ -1548,6 +1856,7 @@ static Args parse_args(int argc, char** argv) {
         if (x == "--ref") a.ref_path = need(x);
         else if (x == "--asm-dir") a.asm_dirs.push_back(need(x));
         else if (x == "--out") a.out_gfa = need(x);
+        else if (x == "--vcf") a.out_vcf = need(x);
 
         else if (x == "--k") a.k = std::stoi(need(x));
         else if (x == "--s") a.s = std::stoi(need(x));
@@ -1566,6 +1875,11 @@ static Args parse_args(int argc, char** argv) {
         else if (x == "--max-full-align") a.max_full_align = std::stoi(need(x));
         else if (x == "--window-pad") a.window_pad = std::stoi(need(x));
         else if (x == "--max-ref-window") a.max_ref_window = std::stoi(need(x));
+
+        else if (x == "--no-ivh") a.use_ivh = false;
+        else if (x == "--ivh-max-occ") a.ivh_max_occ = std::stoi(need(x));
+        else if (x == "--ivh-wing") a.ivh_wing = std::stoi(need(x));
+        else if (x == "--ivh-gap") a.ivh_gap_cap = (uint32_t)std::stoul(need(x));
 
         else if (x == "--top-contigs") a.top_contigs = std::stoi(need(x));
         else if (x == "--min-contig") a.min_contig_len = std::stoi(need(x));
@@ -1592,6 +1906,118 @@ static Args parse_args(int argc, char** argv) {
     return a;
 }
 
+
+struct VcfRecord {
+    std::string chrom;
+    uint32_t pos1 = 0; // 1-based
+    std::string id;
+    std::string ref;
+    std::string alt;
+    std::string info;
+    std::string sample;
+};
+
+
+static std::string info_get(const std::string& info, const std::string& key) {
+    auto p = info.find(key);
+    if (p == std::string::npos) return "";
+    p += key.size();
+    auto e = info.find(';', p);
+    if (e == std::string::npos) e = info.size();
+    return info.substr(p, e - p);
+}
+
+struct MergedVcfRecord {
+    std::string chrom;
+    uint32_t pos1 = 0;
+    std::string id;
+    std::string ref;
+    std::string alt;
+    std::string info;
+    std::unordered_map<std::string, std::string> gt; // sample -> GT
+};
+
+static std::vector<MergedVcfRecord> merge_vcf_multisample(const std::vector<VcfRecord>& recs,
+                                                          const std::vector<std::string>& samples)
+{
+    std::unordered_map<std::string, size_t> idx;
+    std::vector<MergedVcfRecord> out;
+    out.reserve(recs.size());
+
+    auto make_key = [&](const VcfRecord& r) -> std::string {
+        std::string svt = info_get(r.info, "SVTYPE=");
+        std::string end = info_get(r.info, "END=");
+        std::string svl = info_get(r.info, "SVLEN=");
+        std::string chr2 = info_get(r.info, "CHR2=");
+        std::string pos2 = info_get(r.info, "POS2=");
+
+        uint32_t pos_bin = (r.pos1 / 25);
+        long long lenv = 0;
+        try { lenv = std::stoll(svl); } catch (...) { lenv = 0; }
+        uint32_t len_bin = (uint32_t)(std::llabs(lenv) / 50);
+
+        return r.chrom + "|" + svt + "|" + std::to_string(pos_bin) + "|" + end + "|" + std::to_string(len_bin) + "|" + chr2 + "|" + pos2;
+    };
+
+    for (const auto& r : recs) {
+        std::string key = make_key(r);
+        auto it = idx.find(key);
+        if (it == idx.end()) {
+            MergedVcfRecord mr;
+            mr.chrom = r.chrom;
+            mr.pos1  = r.pos1;
+            mr.id    = r.id.substr(r.id.find(':') != std::string::npos ? r.id.find(':')+1 : 0); // drop sample prefix
+            mr.ref   = r.ref;
+            mr.alt   = r.alt;
+            mr.info  = r.info;
+            mr.gt[r.sample] = "1/1";
+            idx[key] = out.size();
+            out.push_back(std::move(mr));
+        } else {
+            out[it->second].gt[r.sample] = "1/1";
+        }
+    }
+
+    // stable-ish ordering
+    std::sort(out.begin(), out.end(), [](const MergedVcfRecord& a, const MergedVcfRecord& b){
+        if (a.chrom != b.chrom) return a.chrom < b.chrom;
+        return a.pos1 < b.pos1;
+    });
+
+    // Ensure all samples have GT
+    for (auto& mr : out) {
+        for (const auto& s : samples) {
+            if (mr.gt.find(s) == mr.gt.end()) mr.gt[s] = "0/0";
+        }
+    }
+    return out;
+}
+
+static void write_vcf(const std::string& out, const std::vector<VcfRecord>& recs, const std::vector<std::string>& samples) {
+    std::ofstream o(out);
+    if (!o) throw std::runtime_error("Failed to write VCF: " + out);
+
+    o << "##fileformat=VCFv4.2\n";
+    o << "##source=syncmer_ivh_pangenome\n";
+    o << "##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"SV type\">\n";
+    o << "##INFO=<ID=END,Number=1,Type=Integer,Description=\"End position\">\n";
+    o << "##INFO=<ID=SVLEN,Number=1,Type=Integer,Description=\"SV length\">\n";
+    o << "##INFO=<ID=CHR2,Number=1,Type=String,Description=\"Second chromosome for TRA\">\n";
+    o << "##INFO=<ID=POS2,Number=1,Type=Integer,Description=\"Second position for TRA\">\n";
+    o << "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT";
+    for (const auto& s : samples) o << "\t" << s;
+    o << "\n";
+
+    auto merged = merge_vcf_multisample(recs, samples);
+    for (const auto& r : merged) {
+        o << r.chrom << "\t" << r.pos1 << "\t" << r.id << "\t"
+          << r.ref << "\t" << r.alt << "\t.\tPASS\t" << r.info
+          << "\tGT";
+        for (const auto& s : samples) o << "\t" << r.gt.at(s);
+        o << "\n";
+    }
+}
+
 // ---------------- Main ----------------
 int main(int argc, char** argv) {
     try {
@@ -1605,6 +2031,12 @@ int main(int argc, char** argv) {
         std::vector<RefContigInfo> ref_infos;
         std::string ref_concat;
         Graph g = build_ref_backbone_graph_all(ref_recs, args.ref_segment, ref_infos, ref_concat, 100);
+        std::unordered_map<std::string,size_t> ref_name_to_cid;
+        for (size_t i=0;i<ref_infos.size();i++) ref_name_to_cid[ref_infos[i].name]=i;
+
+        std::vector<VcfRecord> vcf_recs;
+        std::vector<std::string> sample_order;
+        std::unordered_set<std::string> sample_seen;
 
         std::cerr << "[info] Concatenated reference length: " << ref_concat.size() << "\n";
 
@@ -1618,7 +2050,8 @@ int main(int argc, char** argv) {
 
 
         std::cerr << "[info] Building reference syncmer index...\n";
-        RefIndex ridx = build_ref_index(ref_concat, args.k, args.s, args.t, args.interval_w);
+        RefIndex ridx = build_ref_index(ref_concat, args.k, args.s, args.t, args.interval_w,
+                                        args.use_ivh, args.ivh_max_occ, args.ivh_wing, args.ivh_gap_cap);
         std::cerr << "[info] Buckets: " << ridx.buckets.size() << "\n";
 
         auto asm_files = list_fasta_files_in_dirs(args.asm_dirs, args.recursive);
@@ -1630,6 +2063,7 @@ int main(int argc, char** argv) {
             if (arecs.empty()) { std::cerr << "[warn] Empty assembly FASTA: " << ap << "\n"; continue; }
 
             std::string sample = normalize_sample_name_from_path(ap);
+            if (!sample_seen.count(sample)) { sample_seen.insert(sample); sample_order.push_back(sample); }
 
             std::sort(arecs.begin(), arecs.end(),
                       [](const FastaRecord& a, const FastaRecord& b) { return a.seq.size() > b.seq.size(); });
@@ -1649,8 +2083,23 @@ int main(int argc, char** argv) {
                           << " len=" << qry_seq_full.size() << "\n";
 
                 // --- Seeding/chaining to estimate mapped region ---
-                auto seeds = find_seed_pairs(qry_seq_full, ridx, args.k, args.s, args.t, args.interval_w);
+                auto seeds = find_seed_pairs(qry_seq_full, ridx, args.k, args.s, args.t, args.interval_w, args.use_ivh, args.ivh_wing, args.ivh_gap_cap);
+
+                // If query contig name matches a reference contig name, restrict seeds to that contig.
+                // This suppresses repeat-driven cross-contig placements and reduces false INDEL calls.
+                auto it_rc = ref_name_to_cid.find(contig.name);
+                if (it_rc != ref_name_to_cid.end()) {
+                    auto filtered = filter_seeds_to_refcontig(seeds, ref_infos, it_rc->second);
+                    // Only enforce name-matching if we still have enough seeds; otherwise keep the global search.
+                    if (filtered.size() >= 200) seeds.swap(filtered);
+                }
                 auto chain = chain_seeds(seeds);
+
+                if (chain.points.size() < (size_t)args.min_chain_points) {
+                    std::cerr << "    [warn] Too few anchors in chain (" << chain.points.size()
+                              << " < " << args.min_chain_points << "). Skipping contig.\n";
+                    continue;
+                }
 
                 std::cerr << "    [info] Seeds=" << seeds.size()
                           << " chain_points=" << chain.points.size()
@@ -1752,13 +2201,26 @@ int main(int argc, char** argv) {
                               << " bigI=" << bigI << " bigD=" << bigD << "\n";
                 }
 
-                auto svs = extract_svs_from_cigar(ref_sub, qry_sub, aln.cigar, (uint32_t)args.sv_min);
-                std::cerr << "    [info] SVs >= " << args.sv_min << "bp: " << svs.size() << "\n";
+                auto svs = extract_svs_from_anchors(ref_sub, qry_sub, chain_local,
+                                                    args.k,
+                                                    (uint32_t)args.sv_min_indel,
+                                                    args.flank_anchors,
+                                                    args.call_head_tail_indels);
+                dedup_ins_del(svs);
 
-                // Collect INDEL SVs (do NOT add to graph yet). We'll filter out INDELs that are
-                // likely artifacts of larger rearrangements (INV/DUP/TRA) to avoid double-counting.
-                std::vector<SVEvent> indel_evs;
-                indel_evs.reserve(svs.size());
+                // Remove absurdly large indels which usually indicate a mis-mapped window.
+                svs.erase(std::remove_if(svs.begin(), svs.end(),
+                                         [&](const SVEvent& e){ return (e.type=="INS"||e.type=="DEL") && e.len > 20000; }),
+                          svs.end());
+
+                if (svs.size() > 6) {
+                    std::sort(svs.begin(), svs.end(),
+                              [](const SVEvent& a, const SVEvent& b){ return a.len > b.len; });
+                    svs.resize(6);
+                }
+
+                std::cerr << "    [info] INS/DEL (anchor-gap) >= " << args.sv_min_indel << "bp: " << svs.size() << "\n";
+// Insert SVs into graph with lifted coordinates.
                 for (const auto& sv : svs) {
                     uint32_t sv_ref_global = ref_sub_global0 + sv.ref_pos;
 
@@ -1771,11 +2233,8 @@ int main(int argc, char** argv) {
                     }
                     const std::string& ref_contig_name = ref_infos[ref_cid].name;
 
-                    SVEvent sv_adj = sv;
-                    sv_adj.ref_contig1 = ref_contig_name;
-                    sv_adj.ref_pos = ref_local;
-
                     // If deletion crosses contig boundary, clamp len to contig end.
+                    SVEvent sv_adj = sv;
                     if (sv_adj.type == "DEL") {
                         uint32_t contig_len = ref_infos[ref_cid].len;
                         uint32_t end_local = ref_local + sv_adj.len;
@@ -1783,7 +2242,34 @@ int main(int argc, char** argv) {
                             sv_adj.len = contig_len - ref_local;
                         }
                     }
-                    indel_evs.push_back(std::move(sv_adj));
+
+                    // Heuristic TE/HGT/Starship annotations from allele/ref context (fast triage).
+{
+    const std::string& ref_seq_contig = ref_recs[ref_cid].seq;
+    uint32_t ctx0 = (ref_local > 1000) ? (ref_local - 1000) : 0;
+    uint32_t ctx1 = std::min<uint32_t>(ref_local + 1000, (uint32_t)ref_seq_contig.size());
+    std::string ref_ctx = (ctx1 > ctx0) ? ref_seq_contig.substr(ctx0, (size_t)(ctx1 - ctx0)) : std::string();
+    annotate_mobile_like_sv(sv_adj, ref_ctx);
+}
+
+// Emit VCF record (symbolic alleles for scalability).
+if (!args.out_vcf.empty()) {
+    VcfRecord vr;
+    vr.chrom = ref_contig_name;
+    vr.pos1 = ref_local + 1; // 1-based
+    vr.id = sample + ":" + contig.name + ":" + sv_adj.type + ":" + std::to_string(vr.pos1);
+    vr.ref = "N";
+    vr.alt = "<" + sv_adj.type + ">";
+    uint32_t end1 = ref_local + ((sv_adj.type == "DEL") ? sv_adj.len : 1);
+    vr.info = "SVTYPE=" + sv_adj.type + ";SVLEN=" + std::to_string((int32_t)sv_adj.len) + ";END=" + std::to_string(end1);
+    if (!sv_adj.annot.empty()) vr.info += ";ANNOT=" + sv_adj.annot;
+    vr.sample = sample;
+    vcf_recs.push_back(std::move(vr));
+}
+
+add_sv_to_graph(g, sample, ref_contig_name, contig.name, ref_local, sv_adj, args.ref_segment);
+
+                    total_svs_added++;
                 }
                 // --- K-mer block based complex SV discovery (INV/DUP/TRA) ---
                 // Tuned for ~100 kb contigs and ~100–3000 bp events.
@@ -1848,44 +2334,41 @@ if (!blocks_m.empty() && picked_m.empty()) {
 std::sort(picked.begin(), picked.end(),
           [](const MapBlock& a, const MapBlock& b){ return a.q0 < b.q0; });
 
-                    auto complex_evs = infer_dup_inv_tra_from_blocks(qry_seq_full, ref_infos, picked,
-                                                                     k_complex, tra_min_dist, min_dup_ovl);
+                    auto evs = infer_dup_inv_tra_from_blocks(qry_seq_full, ref_infos, picked,
+                                                             k_complex, tra_min_dist, min_dup_ovl);
 
                     // Avoid counting the same event multiple times from fragmented blocks.
-                    // Coarser bins reduce multi-counting of the same breakpoint produced by fragmented blocks.
-                    // Values tuned for 100 kb contigs and ~100–3000 bp SVs.
-                    complex_evs = dedup_svs(std::move(complex_evs), /*pos_bin=*/500, /*len_bin=*/500);
+                    evs = dedup_svs(std::move(evs));
 
-                    // Filter INDEL calls that are likely just manifestations of larger rearrangements.
-                    // Heuristic: if an INDEL lies within +/-500 bp of a complex breakpoint on the same contig,
-                    // drop it. This prevents double-counting INV/DUP/TRA as multiple small INDELs.
-                    if (!complex_evs.empty() && !indel_evs.empty()) {
-                        const uint32_t PAD = 200;
-                        std::vector<SVEvent> kept;
-                        kept.reserve(indel_evs.size());
-                        for (const auto& e : indel_evs) {
-                            bool near = false;
-                            for (const auto& c : complex_evs) {
-                                if (c.ref_contig1 != e.ref_contig1) continue;
-                                uint32_t c0 = (c.ref_pos > PAD) ? (c.ref_pos - PAD) : 0;
-                                uint32_t c1 = c.ref_pos + std::max<uint32_t>(c.len, 1u) + PAD;
-                                if (e.ref_pos >= c0 && e.ref_pos <= c1) { near = true; break; }
-                            }
-                            if (!near) kept.push_back(e);
-                        }
-                        indel_evs.swap(kept);
-                    }
-
-                    // Add all SV alleles to graph (INDEL first, then complex) after filtering.
-                    for (auto& e : indel_evs) {
-                        add_sv_to_graph(g, sample, e.ref_contig1, contig.name, e.ref_pos, e, args.ref_segment);
-                        total_svs_added++;
-                    }
-                    if (!complex_evs.empty()) {
-                        std::cerr << "    [info] Complex SVs (kmer) : " << complex_evs.size() << "\n";
-                        for (auto& ev : complex_evs) {
+                    if (!evs.empty()) {
+                        std::cerr << "    [info] Complex SVs (kmer) : " << evs.size() << "\n";
+                        for (auto& ev : evs) {
                             if (ev.ref_contig1.empty()) continue;
-                            add_sv_to_graph(g, sample, ev.ref_contig1, contig.name, ev.ref_pos, ev, args.ref_segment);
+                            // VCF for complex SVs
+if (!args.out_vcf.empty()) {
+    VcfRecord vr;
+    vr.chrom = ev.ref_contig1;
+    vr.pos1 = ev.ref_pos + 1;
+    vr.id = sample + ":" + contig.name + ":" + ev.type + ":" + std::to_string(vr.pos1);
+    vr.ref = "N";
+    vr.alt = "<" + ev.type + ">";
+    std::string info = "SVTYPE=" + ev.type;
+    if (ev.type == "TRA") {
+        info += ";SVLEN=0;END=" + std::to_string(ev.ref_pos + 1);
+        info += ";CHR2=" + ev.ref_contig2 + ";POS2=" + std::to_string(ev.ref_pos2 + 1);
+    } else {
+        info += ";SVLEN=" + std::to_string((int32_t)ev.len);
+        uint32_t end1 = ev.ref_pos + std::max<uint32_t>(1, ev.len);
+        info += ";END=" + std::to_string(end1);
+    }
+    if (!ev.annot.empty()) info += ";ANNOT=" + ev.annot;
+    vr.info = info;
+    vr.sample = sample;
+    vcf_recs.push_back(std::move(vr));
+}
+
+add_sv_to_graph(g, sample, ev.ref_contig1, contig.name, ev.ref_pos, ev, args.ref_segment);
+
                             total_svs_added++;
                         }
                     }
@@ -1894,6 +2377,10 @@ std::sort(picked.begin(), picked.end(),
             }
 
             std::cerr << "[info] Sample " << sample << ": total SV alleles added=" << total_svs_added << "\n";
+        }
+        if (!args.out_vcf.empty()) {
+            write_vcf(args.out_vcf, vcf_recs, sample_order);
+            std::cerr << "[done] Wrote " << args.out_vcf << "\n";
         }
 
         g.write_gfa(args.out_gfa);
