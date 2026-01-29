@@ -775,6 +775,9 @@ struct SVEvent {
     // Local position (within the reference contig) of the breakpoint / start of event.
     uint32_t ref_pos = 0;
 
+    // Local query position (within the query contig/window) corresponding to the breakpoint.
+    uint32_t qry_pos = 0;
+
     // Types:
     //   INS / DEL  : extracted from CIGAR on the aligned window
     //   DUP / INV  : inferred from k-mer block mapping (allele stored in allele_seq; INV stored as reverse-complement)
@@ -864,13 +867,29 @@ static std::vector<SVEvent> extract_svs_from_cigar(
         if (c.op == 'M') { r += (uint32_t)c.len; q += (uint32_t)c.len; }
         else if (c.op == 'D') {
             if ((uint32_t)c.len >= sv_min_len) {
-                { SVEvent ev; ev.ref_pos = r; ev.type = "DEL"; ev.allele_seq = "*"; ev.len = (uint32_t)c.len; svs.push_back(ev); }
+                // Record both ref and query coordinates so we can polish/normalize later.
+                SVEvent ev;
+                ev.ref_pos = r;
+                ev.qry_pos = q;
+                ev.type = "DEL";
+                ev.allele_seq = "*";
+                ev.len = (uint32_t)c.len;
+                svs.push_back(std::move(ev));
             }
             r += (uint32_t)c.len;
         } else if (c.op == 'I') {
             if ((uint32_t)c.len >= sv_min_len) {
-                std::string ins = qry.substr(q, (size_t)c.len);
-                { SVEvent ev; ev.ref_pos = r; ev.type = "INS"; ev.allele_seq = ins; ev.len = (uint32_t)c.len; svs.push_back(ev); }
+                SVEvent ev;
+                ev.ref_pos = r;
+                ev.qry_pos = q;
+                ev.type = "INS";
+                ev.len = (uint32_t)c.len;
+                if ((size_t)q + (size_t)c.len <= qry.size()) {
+                    ev.allele_seq = qry.substr(q, (size_t)c.len);
+                } else {
+                    ev.allele_seq = "";
+                }
+                svs.push_back(std::move(ev));
             }
             q += (uint32_t)c.len;
         }
@@ -915,13 +934,13 @@ static std::vector<SVEvent> extract_svs_from_anchors(
     auto add_ins = [&](uint32_t ref_pos, uint32_t qpos, uint32_t len) {
         if (len < min_sv) return;
         if ((size_t)qpos + (size_t)len > qry_sub.size()) return;
-        SVEvent ev; ev.ref_pos = ref_pos; ev.type = "INS"; ev.len = len;
+        SVEvent ev; ev.ref_pos = ref_pos; ev.qry_pos = qpos; ev.type = "INS"; ev.len = len;
         ev.allele_seq = qry_sub.substr(qpos, (size_t)len);
         svs.push_back(std::move(ev));
     };
-    auto add_del = [&](uint32_t ref_pos, uint32_t len) {
+    auto add_del = [&](uint32_t ref_pos, uint32_t qpos, uint32_t len) {
         if (len < min_sv) return;
-        SVEvent ev; ev.ref_pos = ref_pos; ev.type = "DEL"; ev.len = len;
+        SVEvent ev; ev.ref_pos = ref_pos; ev.qry_pos = qpos; ev.type = "DEL"; ev.len = len;
         ev.allele_seq = "*";
         svs.push_back(std::move(ev));
     };
@@ -931,7 +950,7 @@ static std::vector<SVEvent> extract_svs_from_anchors(
         uint32_t r_gap = a0.rpos;
         uint32_t q_gap = a0.qpos;
         if (q_gap > r_gap) add_ins(0, 0, q_gap - r_gap);
-        else if (r_gap > q_gap) add_del(0, r_gap - q_gap);
+        else if (r_gap > q_gap) add_del(0, 0, r_gap - q_gap);
     }
 
     for (size_t i = 1; i < chain_local.points.size(); i++) {
@@ -947,7 +966,7 @@ static std::vector<SVEvent> extract_svs_from_anchors(
         uint32_t r_gap = a.rpos - pr;
         uint32_t q_gap = a.qpos - pq;
         if (q_gap > r_gap) add_ins(pr, pq, q_gap - r_gap);
-        else if (r_gap > q_gap) add_del(pr, r_gap - q_gap);
+        else if (r_gap > q_gap) add_del(pr, pq, r_gap - q_gap);
     }
 
     if (call_head_tail) {
@@ -958,11 +977,104 @@ static std::vector<SVEvent> extract_svs_from_anchors(
             uint32_t r_gap = (uint32_t)ref_sub.size() - pr;
             uint32_t q_gap = (uint32_t)qry_sub.size() - pq;
             if (q_gap > r_gap) add_ins(pr, pq, q_gap - r_gap);
-            else if (r_gap > q_gap) add_del(pr, r_gap - q_gap);
+            else if (r_gap > q_gap) add_del(pr, pq, r_gap - q_gap);
         }
     }
 
     return svs;
+}
+
+
+static inline void left_align_indel(const std::string& ref, SVEvent& ev) {
+    if (ev.type == "DEL") {
+        // Left-align deletion in repeats (VCF normalization style).
+        while (ev.ref_pos > 0 && (ev.ref_pos + ev.len) < (uint32_t)ref.size()) {
+            char prev = (char)std::toupper((unsigned char)ref[ev.ref_pos - 1]);
+            char last = (char)std::toupper((unsigned char)ref[ev.ref_pos + ev.len - 1]);
+            if (prev != last) break;
+            ev.ref_pos -= 1;
+        }
+    } else if (ev.type == "INS") {
+        // Left-align insertion using last base of insertion vs preceding ref base.
+        if (ev.allele_seq == "*" || ev.allele_seq.empty()) return;
+        while (ev.ref_pos > 0) {
+            char prev = (char)std::toupper((unsigned char)ref[ev.ref_pos - 1]);
+            char last = (char)std::toupper((unsigned char)ev.allele_seq.back());
+            if (prev != last) break;
+            // rotate insertion sequence right by 1, move breakpoint left by 1
+            ev.allele_seq.pop_back();
+            ev.allele_seq.insert(ev.allele_seq.begin(), prev);
+            ev.ref_pos -= 1;
+        }
+    }
+}
+
+static inline bool polish_indel_base_resolution(
+    const std::string& ref_sub,
+    const std::string& qry_sub,
+    SVEvent& ev,
+    int mismatch, int gap_open, int gap_ext,
+    uint32_t window = 200)
+{
+    if (ev.type != "INS" && ev.type != "DEL") return false;
+    if (ref_sub.empty() || qry_sub.empty()) return false;
+
+    uint32_t r0 = (ev.ref_pos > window) ? (ev.ref_pos - window) : 0;
+    uint32_t r1 = std::min<uint32_t>((uint32_t)ref_sub.size(), ev.ref_pos + window + (ev.type=="DEL" ? ev.len : 0));
+    uint32_t q0 = (ev.qry_pos > window) ? (ev.qry_pos - window) : 0;
+    uint32_t q1 = std::min<uint32_t>((uint32_t)qry_sub.size(), ev.qry_pos + window + (ev.type=="INS" ? ev.len : 0));
+
+    if (r1 <= r0 || q1 <= q0) return false;
+
+    std::string rwin = ref_sub.substr(r0, (size_t)(r1 - r0));
+    std::string qwin = qry_sub.substr(q0, (size_t)(q1 - q0));
+
+    int band = (int)std::min<uint32_t>(500, 2*window + 50);
+    auto aln = banded_global_affine_bt(rwin, qwin, band, mismatch, gap_open, gap_ext);
+    if (aln.edit >= 1000000000) return false;
+
+    // Walk cigar and find the indel op that best matches expected type/len and is near the original breakpoint.
+    uint32_t rpos = 0, qpos = 0;
+    int best_score = -1;
+    uint32_t best_r = 0, best_q = 0, best_len = ev.len;
+    for (auto &c : aln.cigar) {
+        if (c.op == 'M' || c.op=='=' || c.op=='X') { rpos += c.len; qpos += c.len; continue; }
+        if (c.op == 'I') {
+            if (ev.type == "INS") {
+                int len_bonus = - (int)std::abs((int)c.len - (int)ev.len);
+                int pos_bonus = - (int)std::abs((int)((r0 + rpos) - ev.ref_pos));
+                int sc = 1000 + 5*len_bonus + pos_bonus;
+                if (sc > best_score) { best_score = sc; best_r = r0 + rpos; best_q = q0 + qpos; best_len = c.len; }
+            }
+            qpos += c.len;
+            continue;
+        }
+        if (c.op == 'D') {
+            if (ev.type == "DEL") {
+                int len_bonus = - (int)std::abs((int)c.len - (int)ev.len);
+                int pos_bonus = - (int)std::abs((int)((r0 + rpos) - ev.ref_pos));
+                int sc = 1000 + 5*len_bonus + pos_bonus;
+                if (sc > best_score) { best_score = sc; best_r = r0 + rpos; best_q = q0 + qpos; best_len = c.len; }
+            }
+            rpos += c.len;
+            continue;
+        }
+    }
+    if (best_score < 0) return false;
+
+    ev.ref_pos = best_r;
+    ev.qry_pos = best_q;
+    ev.len = best_len;
+    if (ev.type == "INS") {
+        if ((size_t)ev.qry_pos + (size_t)ev.len <= qry_sub.size()) {
+            ev.allele_seq = qry_sub.substr(ev.qry_pos, (size_t)ev.len);
+        }
+    } else {
+        ev.allele_seq = "*";
+    }
+
+    left_align_indel(ref_sub, ev);
+    return true;
 }
 
 static void dedup_ins_del(std::vector<SVEvent>& svs, uint32_t pos_tol=50, double len_tol=0.35) {
@@ -1610,6 +1722,15 @@ static Graph build_ref_backbone_graph_all(const std::vector<FastaRecord>& ref_re
     for (const auto& rr : ref_recs) {
         if (rr.seq.empty()) continue;
 
+        // IMPORTANT: insert the inter-contig separator *before* recording start_global
+        // for the next contig. Otherwise global_to_contig() becomes inconsistent and
+        // SV coordinates can be mapped to the wrong reference contig.
+        if (!first_contig) {
+            out_concat.append((size_t)concat_sep_len, 'N');
+            cursor += (uint32_t)concat_sep_len;
+        }
+        first_contig = false;
+
         RefContigInfo info;
         info.name = rr.name.empty() ? ("ref_contig" + std::to_string(out_infos.size())) : rr.name;
         info.start_global = cursor;
@@ -1632,12 +1753,6 @@ static Graph build_ref_backbone_graph_all(const std::vector<FastaRecord>& ref_re
         }
 
         // concatenate ref sequence for indexing/alignment
-        if (!first_contig) {
-            out_concat.append((size_t)concat_sep_len, 'N');
-            cursor += (uint32_t)concat_sep_len;
-        }
-        first_contig = false;
-
         out_concat += rr.seq;
         cursor += info.len;
     }
@@ -1794,8 +1909,10 @@ struct Args {
 
     int sv_min = 50;
     int sv_min_indel = 200; // minimum INS/DEL length (reduces overcalling)
+    int polish_window = 200; // bp window for base-resolution INS/DEL polishing
     int flank_anchors = 8; // anchors required on each side for anchor-gap indels
     int min_chain_points = 15; // skip SV calling if fewer anchors
+    int min_seeds_per_ref_contig = 50; // choose mapping contig only if enough seeds support it
     bool call_head_tail_indels = false; // head/tail indels are often artifacts
 
     int ref_segment = 1000;
@@ -1835,6 +1952,10 @@ static void usage() {
         << "  --gap-open INT       gap open cost (default 5)\n"
         << "  --gap-ext INT        gap extend cost (default 1)\n"
         << "  --sv INT             SV threshold (default 50)\n"
+        << "  --sv-indel INT       INS/DEL threshold (default 200)\n"
+        << "  --polish-window INT  window for base-resolution INS/DEL polishing (default 200)\n"
+        << "  --min-seeds INT      minimum seeds supporting a single ref contig before chaining (default 50)\n"
+        << "  --head-tail          also call head/tail indels (default off)\n"
         << "  --seg INT            ref segment size (default 1000)\n"
         << "  --max-full-align INT full align only if ref+contig <= this (default 200000)\n"
         << "  --window-pad INT     pad around mapped region (default 20000)\n"
@@ -1871,6 +1992,10 @@ static Args parse_args(int argc, char** argv) {
         else if (x == "--gap-ext") a.gap_ext = std::stoi(need(x));
 
         else if (x == "--sv") a.sv_min = std::stoi(need(x));
+        else if (x == "--sv-indel") a.sv_min_indel = std::stoi(need(x));
+        else if (x == "--polish-window") a.polish_window = std::stoi(need(x));
+        else if (x == "--min-seeds") a.min_seeds_per_ref_contig = std::stoi(need(x));
+        else if (x == "--head-tail") a.call_head_tail_indels = true;
         else if (x == "--seg") a.ref_segment = std::stoi(need(x));
         else if (x == "--max-full-align") a.max_full_align = std::stoi(need(x));
         else if (x == "--window-pad") a.window_pad = std::stoi(need(x));
@@ -2087,12 +2212,44 @@ int main(int argc, char** argv) {
 
                 // If query contig name matches a reference contig name, restrict seeds to that contig.
                 // This suppresses repeat-driven cross-contig placements and reduces false INDEL calls.
+                // Decide which reference contig to map this assembly contig to.
+                // We (1) optionally honor name matches, but (2) always compute the best-supported
+                // contig by seed count to be robust to repeats/starships.
+                size_t chosen_cid = (size_t)-1;
+
+                // (1) Optional: if query contig name matches a ref contig, prefer it if it has support.
                 auto it_rc = ref_name_to_cid.find(contig.name);
                 if (it_rc != ref_name_to_cid.end()) {
                     auto filtered = filter_seeds_to_refcontig(seeds, ref_infos, it_rc->second);
-                    // Only enforce name-matching if we still have enough seeds; otherwise keep the global search.
-                    if (filtered.size() >= 200) seeds.swap(filtered);
+                    if ((int)filtered.size() >= args.min_seeds_per_ref_contig) {
+                        seeds.swap(filtered);
+                        chosen_cid = it_rc->second;
+                    }
                 }
+
+                // (2) Compute best-supported ref contig by seed count (majority vote), then restrict.
+                {
+                    std::unordered_map<size_t, int> cnt;
+                    cnt.reserve(32);
+                    for (const auto& sp : seeds) {
+                        size_t cid = 0; uint32_t local = 0;
+                        if (!global_to_contig(ref_infos, sp.rpos, cid, local)) continue;
+                        cnt[cid]++;
+                    }
+                    size_t best_cid = 0;
+                    int best_n = 0;
+                    for (const auto& kv : cnt) {
+                        if (kv.second > best_n) { best_n = kv.second; best_cid = kv.first; }
+                    }
+                    if (best_n < args.min_seeds_per_ref_contig) {
+                        std::cerr << "    [warn] Seeds spread across contigs (best=" << best_n
+                                  << " < " << args.min_seeds_per_ref_contig << "). Skipping contig.\n";
+                        continue;
+                    }
+                    seeds = filter_seeds_to_refcontig(seeds, ref_infos, best_cid);
+                    chosen_cid = best_cid;
+                }
+
                 auto chain = chain_seeds(seeds);
 
                 if (chain.points.size() < (size_t)args.min_chain_points) {
@@ -2133,6 +2290,20 @@ int main(int argc, char** argv) {
                     if (!ok) {
                         std::cerr << "    [warn] No reliable chain/window (or too few seeds). Skipping contig.\n";
                         continue;
+                    }
+
+                    // Keep the window strictly inside the chosen reference contig bounds.
+                    // This prevents breakpoint normalization/polishing from drifting across
+                    // contig separators in the concatenated reference.
+                    if (chosen_cid != (size_t)-1 && chosen_cid < ref_infos.size()) {
+                        uint32_t c_st = ref_infos[chosen_cid].start_global;
+                        uint32_t c_en = c_st + ref_infos[chosen_cid].len;
+                        if (win.r0 < c_st) win.r0 = c_st;
+                        if (win.r1 > c_en) win.r1 = c_en;
+                        if (win.r1 <= win.r0) {
+                            std::cerr << "    [warn] Window fell outside chosen contig bounds. Skipping contig.\n";
+                            continue;
+                        }
                     }
 
                     ref_sub = ref_concat.substr(win.r0, (size_t)(win.r1 - win.r0));
@@ -2201,11 +2372,65 @@ int main(int argc, char** argv) {
                               << " bigI=" << bigI << " bigD=" << bigD << "\n";
                 }
 
-                auto svs = extract_svs_from_anchors(ref_sub, qry_sub, chain_local,
-                                                    args.k,
-                                                    (uint32_t)args.sv_min_indel,
-                                                    args.flank_anchors,
-                                                    args.call_head_tail_indels);
+                // INS/DEL discovery: anchor-gap geometry (robust to fungal repeats) + confirm with CIGAR.
+                auto svs_anchor = extract_svs_from_anchors(ref_sub, qry_sub, chain_local,
+                                                         args.k,
+                                                         (uint32_t)args.sv_min_indel,
+                                                         args.flank_anchors,
+                                                         args.call_head_tail_indels);
+                auto svs_cigar  = extract_svs_from_cigar(ref_sub, qry_sub, aln.cigar,
+                                                        (uint32_t)args.sv_min_indel);
+
+                // Polish both to single-base breakpoints in their local windows.
+                for (auto &ev : svs_anchor) {
+                    (void)polish_indel_base_resolution(ref_sub, qry_sub, ev,
+                                                      args.mismatch, args.gap_open, args.gap_ext,
+                                                      (uint32_t)args.polish_window);
+                }
+                for (auto &ev : svs_cigar) {
+                    (void)polish_indel_base_resolution(ref_sub, qry_sub, ev,
+                                                      args.mismatch, args.gap_open, args.gap_ext,
+                                                      (uint32_t)args.polish_window);
+                }
+
+                dedup_ins_del(svs_anchor);
+                dedup_ins_del(svs_cigar);
+
+                // Keep only indels supported by BOTH signals (cuts false positives in repeats drastically).
+                auto svs = intersect_indels_supported(svs_anchor, svs_cigar,
+                                                     /*pos_tol=*/150,
+                                                     /*len_tol=*/0.35);
+
+                // Rescue high-confidence anchor-only indels.
+                // In fungal assemblies, large novel insertions (TEs/starships) can be represented in DP as
+                // complex mismatches or fragmented indels even when the anchor geometry is clear.
+                // We keep only very large anchor-only events and cap them per contig.
+                auto already = [&](const SVEvent& x)->bool{
+                    for (const auto& y : svs) {
+                        if (x.type != y.type) continue;
+                        uint32_t dx = (x.ref_pos > y.ref_pos) ? (x.ref_pos - y.ref_pos) : (y.ref_pos - x.ref_pos);
+                        if (dx > 150) continue;
+                        double lo = (double)x.len * 0.65;
+                        double hi = (double)x.len * 1.35;
+                        if ((double)y.len >= lo && (double)y.len <= hi) return true;
+                    }
+                    return false;
+                };
+                const uint32_t rescue_min = (uint32_t)std::max<int>(args.sv_min_indel, 800);
+                int rescued = 0;
+                for (const auto& x : svs_anchor) {
+                    if (rescued >= 2) break;
+                    if (x.len < rescue_min) continue;
+                    if (already(x)) continue;
+                    if (x.type == "INS") {
+                        if (x.allele_seq.empty()) continue;
+                        size_t nN = 0;
+                        for (char c : x.allele_seq) if (c == 'N') nN++;
+                        if (nN > x.allele_seq.size()/10) continue; // too many Ns
+                    }
+                    svs.push_back(x);
+                    rescued++;
+                }
                 dedup_ins_del(svs);
 
                 // Remove absurdly large indels which usually indicate a mis-mapped window.
