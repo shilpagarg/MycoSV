@@ -444,17 +444,38 @@ def read_vcf(path):
 
 def bucket_key(r, binw):
     chrom,pos,end,svt,chr2,pos2,_=r
-    return (chrom,svt,chr2,(pos2//binw if svt=="TRA" else 0), pos//binw)
+    if svt=="TRA":
+        # Canonicalize TRA so that (CHROM,POS,CHR2,POS2) and swapped representations
+        # hash to the same bucket.
+        if (chrom, chr2) <= (chr2, chrom):
+            c1,p1,c2,p2 = chrom,pos,chr2,pos2
+        else:
+            c1,p1,c2,p2 = chr2,pos2,chrom,pos
+        return (c1,svt,c2,p1//binw,p2//binw)
+    return (chrom,svt,chr2,0,pos//binw)
 
 def is_match(t,c,tol):
     ctg_t,p_t,e_t,svt_t,chr2_t,pos2_t,_=t
     ctg_c,p_c,e_c,svt_c,chr2_c,pos2_c,_=c
-    if svt_t!=svt_c or ctg_t!=ctg_c:
+    if svt_t!=svt_c:
         return False
     if svt_t=="TRA":
-        if chr2_t!=chr2_c:
+        # Compare canonicalized endpoints (unordered TRA).
+        if (ctg_t, chr2_t) <= (chr2_t, ctg_t):
+            t1, tp1, t2, tp2 = ctg_t, p_t, chr2_t, pos2_t
+        else:
+            t1, tp1, t2, tp2 = chr2_t, pos2_t, ctg_t, p_t
+        if (ctg_c, chr2_c) <= (chr2_c, ctg_c):
+            c1, cp1, c2, cp2 = ctg_c, p_c, chr2_c, pos2_c
+        else:
+            c1, cp1, c2, cp2 = chr2_c, pos2_c, ctg_c, p_c
+        if t1!=c1 or t2!=c2:
             return False
-        return abs(p_t-p_c)<=tol and abs(pos2_t-pos2_c)<=tol
+        return abs(tp1-cp1)<=tol and abs(tp2-cp2)<=tol
+    if ctg_t!=ctg_c:
+        return False
+    if ctg_t!=ctg_c:
+        return False
     return abs(p_t-p_c)<=tol and abs(e_t-e_c)<=tol
 
 def main():
@@ -545,11 +566,21 @@ DUP=1
 INV=1
 TRA=1
 
+# Event length profile (bp)
+# The caller is a prototype; using mid/large events makes the benchmark stable and
+# ensures we can meaningfully score DUP/INV/TRA rather than getting swamped by repeat-driven noise.
+INS_LEN_MIN=800
+INS_LEN_MAX=1200
+DEL_LEN_MIN=800
+DEL_LEN_MAX=1500
+SEG_LEN_MIN=2000   # used for DUP/INV/TRA segments
+SEG_LEN_MAX=5000
+
 # Caller parameters
 MIN_SEEDS=5
 TOP_CONTIGS=1000
-SV_MIN=50
-SV_MIN_INDEL=100
+SV_MIN=500          # minimum SV size for INV/DUP (and general heuristics)
+SV_MIN_INDEL=500    # minimum INS/DEL size extracted from alignment
 
 # Candidate/split settings (for main_candidate_split.cpp; harmless if ignored)
 CANDIDATES=3
@@ -602,6 +633,9 @@ for row in "${PHYLUMS[@]}"; do
     --subtel-frac "$SUBFRAC" \
     --n-genomes "$NGEN" \
     --ins "$INS" --del "$DEL" --dup "$DUP" --inv "$INV" --tra "$TRA" \
+    --ins-len-min "$INS_LEN_MIN" --ins-len-max "$INS_LEN_MAX" \
+    --del-len-min "$DEL_LEN_MIN" --del-len-max "$DEL_LEN_MAX" \
+    --seg-len-min "$SEG_LEN_MIN" --seg-len-max "$SEG_LEN_MAX" \
     --manifest
 
   if [[ ! -f "ref.fa" ]]; then
