@@ -1,31 +1,48 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# run_phylum_refcoords_bench.sh
+# run_phylum_refcoords_bench_updated.sh
 #
 # Simulate fungal genomes per phylum with test_amf.py, run main.cpp SV caller,
 # lift truth into reference-coordinate VCF (replay liftover), then compare truth vs calls.
 #
 # Usage:
-#   bash run_phylum_refcoords_bench.sh \
-#       /mnt/data/test_amf.py \
-#       /mnt/data/main.cpp \
-#       results_phyla_refcoords
+#   PHYLUM_FILTER=Basidiomycota \
+#   bash run_phylum_refcoords_bench_updated.sh /path/test_amf.py /path/main.cpp results_dir
+
+#	chmod +x /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/run_phylum_refcoords_bench.sh
+
+#	PHYLUM_FILTER=Basidiomycota \
+#	bash /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/run_phylum_refcoords_bench.sh \
+#	  /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/test_amf.py \
+#	  /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/main.cpp \
+#	  results_basidio_candidate_split
+#
+# Inputs:
+#   $1 = test_amf.py
+#   $2 = main.cpp (or main_candidate_split.cpp)
+#   $3 = output root directory
+#
+# Environment variables (optional):
+#   PHYLUM_FILTER   : if set, only runs that phylum (exact match)
+#   N_GENOMES       : override n-genomes per phylum (default per table)
+#   TOTAL_LEN       : override total-len per phylum (default per table)
+#   TOL_BP          : breakpoint tolerance for evaluation (default 1000)
 #
 # Outputs:
-#   results_phyla_refcoords/<phylum>/
-#       ref.fa
-#       assemblies/
-#           asm_*.fa
-#           truth.tsv
-#           manifest.tsv (if produced)
-#       truth.refcoords.vcf
-#       out.vcf
-#       out.gfa
-#       stdout.log
-#       stderr.log
-#       metrics.txt
-#   results_phyla_refcoords/metrics.tsv
+#   results_dir/<phylum>/
+#     ref.fa
+#     assemblies/
+#       asm_*.fa
+#       truth_all.tsv
+#       manifest.tsv (if produced)
+#     truth.refcoords.vcf
+#     out.vcf
+#     out.gfa
+#     stdout.log
+#     stderr.log
+#     metrics.txt
+#   results_dir/metrics.tsv
 
 TEST_AMF="${1:-/mnt/data/test_amf.py}"
 MAIN_CPP="${2:-/mnt/data/main.cpp}"
@@ -40,6 +57,8 @@ if [[ ! -f "$MAIN_CPP" ]]; then
   exit 1
 fi
 
+# Make ROOT_OUT absolute to avoid nested path duplication after pushd
+ROOT_OUT="$(realpath -m "$ROOT_OUT")"
 mkdir -p "$ROOT_OUT"
 
 BIN="$ROOT_OUT/fungi_pangenome"
@@ -47,7 +66,7 @@ echo "[info] Compiling $MAIN_CPP -> $BIN"
 g++ -O3 -std=c++17 -pthread "$MAIN_CPP" -o "$BIN"
 
 # -----------------------------------------------------------------------------
-# truth.tsv -> truth.refcoords.vcf (reference coordinate space) via replay liftover
+# truth_all.tsv -> truth.refcoords.vcf (reference coordinate space) via replay liftover
 # -----------------------------------------------------------------------------
 TRUTH_LIFT="$ROOT_OUT/truth_to_refcoords_vcf.py"
 cat > "$TRUTH_LIFT" <<'PY'
@@ -59,8 +78,6 @@ from collections import defaultdict
 
 @dataclass
 class Block:
-    # Maps a CURRENT interval [cur0, cur1) to reference coordinates.
-    # If ref0/ref1 are None => inserted sequence (no reference origin)
     cur0: int
     cur1: int
     ref_ctg: str
@@ -75,8 +92,7 @@ def load_fasta_lengths(ref_fa: str) -> Dict[str,int]:
     with open(ref_fa) as f:
         for line in f:
             line=line.strip()
-            if not line:
-                continue
+            if not line: continue
             if line.startswith(">"):
                 if name is not None:
                     lens[name]=cur
@@ -89,11 +105,6 @@ def load_fasta_lengths(ref_fa: str) -> Dict[str,int]:
     return lens
 
 def parse_truth_tsv(path: str):
-    """
-    Expecting test_amf.py truth.tsv with headers like:
-      asm, event_id, type, contig, pos/start/end, length, target_contig, target, extra ...
-    We parse flexibly by header name.
-    """
     with open(path) as f:
         hdr=f.readline().rstrip("\n").split("\t")
         idx={h:i for i,h in enumerate(hdr)}
@@ -101,28 +112,25 @@ def parse_truth_tsv(path: str):
             return parts[idx[k]] if k in idx and idx[k] < len(parts) else default
         for line in f:
             line=line.rstrip("\n")
-            if not line:
-                continue
+            if not line: continue
             p=line.split("\t")
             yield {
                 "asm": g(p,"asm"),
                 "event_id": int(g(p,"event_id","0") or "0"),
-                "type": g(p,"type") or g(p,"kind") or "",
+                "type": (g(p,"type") or g(p,"kind") or "").upper(),
                 "contig": g(p,"contig") or "",
                 "pos": int(g(p,"pos","0") or "0"),
                 "start": int(g(p,"start","0") or "0"),
                 "end": int(g(p,"end","0") or "0"),
-                "target_contig": g(p,"target_contig") or g(p,"chr2") or g(p,"to_contig") or "",
-                "target": int(g(p,"target","0") or g(p,"pos2","0") or "0"),
-                "length": int(g(p,"length","0") or g(p,"svlen","0") or "0"),
-                "extra": g(p,"extra") or ""
+                "target_contig": g(p,"target_contig") or g(p,"to_contig") or "",
+                "target": int(g(p,"target","0") or "0"),
+                "length": int(g(p,"length","0") or "0"),
             }
 
 def blocks_total_len(blks: List[Block]) -> int:
     return blks[-1].cur1 if blks else 0
 
 def split_at(blks: List[Block], x: int) -> None:
-    # Ensure a block boundary at current coordinate x
     i=0
     while i < len(blks):
         b=blks[i]
@@ -140,7 +148,6 @@ def split_at(blks: List[Block], x: int) -> None:
                     right_ref0 = left_ref1
                     right_ref1 = b.ref1
                 else:
-                    # reverse: as cur increases, ref decreases
                     left_ref1 = b.ref1
                     left_ref0 = b.ref1 - left_len
                     right_ref1 = left_ref0
@@ -152,25 +159,17 @@ def split_at(blks: List[Block], x: int) -> None:
         i += 1
 
 def shift_blocks(blks: List[Block], start_idx: int, delta: int) -> None:
-    if delta == 0:
-        return
+    if delta == 0: return
     for j in range(start_idx, len(blks)):
         blks[j].cur0 += delta
         blks[j].cur1 += delta
 
 def map_point_to_ref(blks: List[Block], x: int) -> Tuple[str, Optional[int]]:
-    """
-    Map a current coordinate breakpoint x to (ref_contig, ref_pos0based or None).
-    If in inserted seq, ref position None. We anchor breakpoints to left base when possible.
-    """
     if not blks:
         return ("", None)
-    if x < 0:
-        x = 0
+    if x < 0: x = 0
     L = blocks_total_len(blks)
-    if x > L:
-        x = L
-
+    if x > L: x = L
     probe = x-1 if x > 0 else x
     for b in blks:
         if b.cur0 <= probe < b.cur1:
@@ -180,31 +179,25 @@ def map_point_to_ref(blks: List[Block], x: int) -> Tuple[str, Optional[int]]:
             if b.strand == +1:
                 return (b.ref_ctg, b.ref0 + off)
             else:
-                return (b.ref_ctg, (b.ref1 - 1 - off))
+                return (b.ref_ctg, b.ref1 - 1 - off)
     return (blks[0].ref_ctg, None)
 
 def extract_range(blks: List[Block], s: int, e: int) -> List[Block]:
-    # assumes split_at already done for s,e
     frag=[]
     for b in blks:
-        if b.cur1 <= s:
-            continue
-        if b.cur0 >= e:
-            break
+        if b.cur1 <= s: continue
+        if b.cur0 >= e: break
         if b.cur0 >= s and b.cur1 <= e:
             frag.append(b)
-
-    # Rebase extracted blocks to [0, len)
     out=[]
     cur=0
     for b in frag:
-        seg_len = b.cur1 - b.cur0
-        out.append(Block(cur, cur+seg_len, b.ref_ctg, b.ref0, b.ref1, b.strand))
-        cur += seg_len
+        L = b.cur1 - b.cur0
+        out.append(Block(cur, cur+L, b.ref_ctg, b.ref0, b.ref1, b.strand))
+        cur += L
     return out
 
 def delete_range(blks: List[Block], s: int, e: int) -> None:
-    # assumes split_at done
     i=0
     while i < len(blks):
         b=blks[i]
@@ -217,8 +210,6 @@ def delete_range(blks: List[Block], s: int, e: int) -> None:
             del blks[i]
             continue
         i += 1
-
-    # shift blocks with cur0>=e left by (e-s)
     shift = e - s
     j=0
     while j < len(blks) and blks[j].cur0 < e:
@@ -228,9 +219,7 @@ def delete_range(blks: List[Block], s: int, e: int) -> None:
         blks[k].cur1 -= shift
 
 def insert_blocks(blks: List[Block], x: int, ins: List[Block]) -> None:
-    # assumes split_at done for x
-    if not ins:
-        return
+    if not ins: return
     idx=0
     while idx < len(blks) and blks[idx].cur0 < x:
         idx += 1
@@ -242,32 +231,20 @@ def insert_blocks(blks: List[Block], x: int, ins: List[Block]) -> None:
     blks[idx:idx] = reb
 
 def invert_range(blks: List[Block], s: int, e: int) -> None:
-    # assumes split_at done
     idx_s=None
     idx_e=None
     for i,b in enumerate(blks):
-        if b.cur0 == s:
-            idx_s=i
-        if b.cur0 == e:
-            idx_e=i
-            break
-    if idx_s is None:
-        return
-    if idx_e is None:
-        idx_e=len(blks)
-
+        if b.cur0 == s: idx_s=i
+        if b.cur0 == e: idx_e=i; break
+    if idx_s is None: return
+    if idx_e is None: idx_e=len(blks)
     frag=blks[idx_s:idx_e]
-    L = e - s
-
-    # Reverse order and flip strand
     new=[]
     cur=0
     for b in reversed(frag):
-        seg_len = b.cur1 - b.cur0
-        new_strand = -b.strand
-        new.append(Block(cur, cur+seg_len, b.ref_ctg, b.ref0, b.ref1, new_strand))
-        cur += seg_len
-
+        L = b.cur1 - b.cur0
+        new.append(Block(cur, cur+L, b.ref_ctg, b.ref0, b.ref1, -b.strand))
+        cur += L
     for i,b in enumerate(new):
         new[i] = Block(s + b.cur0, s + b.cur1, b.ref_ctg, b.ref0, b.ref1, b.strand)
     blks[idx_s:idx_e] = new
@@ -277,7 +254,7 @@ def make_inserted_block(ref_ctg: str, L: int) -> List[Block]:
 
 def main():
     if len(sys.argv) != 4:
-        print("usage: truth_to_refcoords_vcf.py ref.fa truth.tsv out.vcf", file=sys.stderr)
+        print("usage: truth_to_refcoords_vcf.py ref.fa truth_all.tsv out.vcf", file=sys.stderr)
         sys.exit(1)
 
     ref_fa, truth_tsv, out_vcf = sys.argv[1:]
@@ -291,18 +268,17 @@ def main():
 
     samples = sorted(evs_by_asm.keys())
 
-    # Initialize per-assembly per-contig block maps as identity to reference
     maps: Dict[str, Dict[str, List[Block]]] = {}
     for asm in samples:
         maps[asm] = {}
         for ctg,L in ref_lens.items():
             maps[asm][ctg] = [Block(0, L, ctg, 0, L, +1)]
 
-    records=[]  # (ref_chr, pos1, id, info, asm)
+    records=[]
 
     for asm in samples:
         for ev in evs_by_asm[asm]:
-            t = ev["type"].upper()
+            t = ev["type"]
             if t not in ("INS","DEL","DUP","INV","TRA"):
                 continue
 
@@ -396,7 +372,6 @@ def main():
                 delete_range(blks_src, s0, s1)
                 insert_blocks(blks_tgt, target, frag)
 
-    # Sort records for VCF output
     records.sort(key=lambda x: (x[0], x[1], x[2]))
 
     with open(out_vcf, "w") as o:
@@ -447,24 +422,20 @@ def read_vcf(path):
     recs=[]
     with open(path) as f:
         for line in f:
-            if line.startswith("##"):
-                continue
+            if line.startswith("##"): continue
             if line.startswith("#CHROM"):
                 samples=line.rstrip("\n").split("\t")[9:]
                 continue
-            if not line.strip() or line.startswith("#"):
-                continue
+            if not line.strip() or line.startswith("#"): continue
             P=line.rstrip("\n").split("\t")
-            chrom=P[0]
-            pos=int(P[1])
+            chrom=P[0]; pos=int(P[1])
             info=parse_info(P[7])
             svt=info.get("SVTYPE","")
             end=int(info.get("END",str(pos)))
             chr2=info.get("CHR2","")
             pos2=int(info.get("POS2","0")) if "POS2" in info else 0
-            gts=P[9:]
             present=set()
-            for s,gt in zip(samples,gts):
+            for s,gt in zip(samples, P[9:]):
                 gt=gt.strip()
                 if gt not in ("0","0/0","./."):
                     present.add(s)
@@ -478,15 +449,13 @@ def bucket_key(r, binw):
 def is_match(t,c,tol):
     ctg_t,p_t,e_t,svt_t,chr2_t,pos2_t,_=t
     ctg_c,p_c,e_c,svt_c,chr2_c,pos2_c,_=c
-    if svt_t != svt_c:
+    if svt_t!=svt_c or ctg_t!=ctg_c:
         return False
-    if ctg_t != ctg_c:
-        return False
-    if svt_t == "TRA":
-        if chr2_t != chr2_c:
+    if svt_t=="TRA":
+        if chr2_t!=chr2_c:
             return False
-        return abs(p_t - p_c) <= tol and abs(pos2_t - pos2_c) <= tol
-    return abs(p_t - p_c) <= tol and abs(e_t - e_c) <= tol
+        return abs(p_t-p_c)<=tol and abs(pos2_t-pos2_c)<=tol
+    return abs(p_t-p_c)<=tol and abs(e_t-e_c)<=tol
 
 def main():
     if len(sys.argv) < 3:
@@ -495,7 +464,7 @@ def main():
     truth_vcf=sys.argv[1]
     out_vcf=sys.argv[2]
     tol=int(sys.argv[3]) if len(sys.argv)>3 else 1000
-    binw=max(200, tol)
+    binw=max(200,tol)
 
     truth=read_vcf(truth_vcf)
     calls=read_vcf(out_vcf)
@@ -549,19 +518,25 @@ PY
 chmod +x "$EVAL"
 
 # -----------------------------------------------------------------------------
-# Phylum presets (heuristics for stress-testing; adjust as you like)
+# Phylum presets (heuristics)
 # Columns: PHYLUM GC REP SUBTEL_REP SUBTEL_FRAC TOTAL_LEN N_CONTIGS N_GENOMES
 # -----------------------------------------------------------------------------
 PHYLUMS=(
-  "Basidiomycota        0.50 0.18 0.35 0.10 200000 12 10"
-  "Ascomycota           0.48 0.12 0.25 0.10 200000 12 10"
-  "Mucoromycota         0.40 0.20 0.40 0.12 180000 12 10"
-  "Zoopagomycota        0.42 0.22 0.45 0.12 180000 12 10"
-  "Chytridiomycota      0.45 0.15 0.30 0.10 160000 10 10"
-  "Blastocladiomycota   0.46 0.16 0.32 0.10 160000 10 10"
-  "Microsporidia        0.25 0.05 0.10 0.06  80000  6  10"
-  "Cryptomycota         0.38 0.20 0.40 0.12 160000 10 10"
+  "Basidiomycota        0.50 0.18 0.35 0.10 200000 12 5"
+  "Ascomycota           0.48 0.12 0.25 0.10 200000 12 5"
+  "Mucoromycota         0.40 0.20 0.40 0.12 200000 12 5"
+  "Zoopagomycota        0.42 0.22 0.45 0.12 200000 12 5"
+  "Chytridiomycota      0.45 0.15 0.30 0.10 200000 12 5"
+  "Blastocladiomycota   0.46 0.16 0.32 0.10 200000 12 5"
+  "Microsporidia        0.25 0.05 0.10 0.06 200000 12 5"
+  "Cryptomycota         0.38 0.20 0.40 0.12 200000 12 5"
 )
+
+# Allow overrides
+PHYLUM_FILTER="${PHYLUM_FILTER:-}"
+TOL_BP="${TOL_BP:-1000}"
+OVR_NGEN="${N_GENOMES:-}"
+OVR_TLEN="${TOTAL_LEN:-}"
 
 # SV profile per genome
 INS=2
@@ -570,12 +545,19 @@ DUP=1
 INV=1
 TRA=1
 
-# Caller parameters (chosen to avoid contig skipping in repeat-heavy sims)
+# Caller parameters
 MIN_SEEDS=5
 TOP_CONTIGS=1000
 SV_MIN=50
 SV_MIN_INDEL=100
-TOL_BP=1000
+
+# Candidate/split settings (for main_candidate_split.cpp; harmless if ignored)
+CANDIDATES=3
+MAPQ_RATIO=1.15
+SPLIT_MAP=1
+
+# Extra runtime-stabilization knobs (if supported; ignored otherwise)
+VCF_CHECKPOINT=1
 
 echo -e "phylum\tTP\tFP\tFN\tprecision\trecall" > "$ROOT_OUT/metrics.tsv"
 
@@ -583,6 +565,11 @@ for row in "${PHYLUMS[@]}"; do
   # shellcheck disable=SC2206
   F=($row)
   PHYLUM="${F[0]}"
+
+  if [[ -n "$PHYLUM_FILTER" && "$PHYLUM" != "$PHYLUM_FILTER" ]]; then
+    continue
+  fi
+
   GC="${F[1]}"
   REP="${F[2]}"
   SUBREP="${F[3]}"
@@ -591,14 +578,19 @@ for row in "${PHYLUMS[@]}"; do
   NCONTIG="${F[6]}"
   NGEN="${F[7]}"
 
+  if [[ -n "$OVR_TLEN" ]]; then TLEN="$OVR_TLEN"; fi
+  if [[ -n "$OVR_NGEN" ]]; then NGEN="$OVR_NGEN"; fi
+
   OUT="$ROOT_OUT/$PHYLUM"
-  ASM="$OUT/assemblies"
+  mkdir -p "$OUT"
+  pushd "$OUT" >/dev/null
+
+  ASM="assemblies"
   mkdir -p "$ASM"
 
   echo "[info] ---- $PHYLUM ----"
-  pushd "$OUT" >/dev/null
+  echo "[info] Simulating: total-len=$TLEN n-contigs=$NCONTIG n-genomes=$NGEN"
 
-  echo "[info] Simulating with test_amf.py"
   python3 "$TEST_AMF" \
     --seed 42 \
     --outdir "$ASM" \
@@ -616,15 +608,15 @@ for row in "${PHYLUMS[@]}"; do
     echo "[error] ref.fa missing for $PHYLUM" >&2
     exit 1
   fi
-  if [[ ! -f "$ASM/truth.tsv" ]]; then
-    echo "[error] truth.tsv missing at $ASM/truth.tsv for $PHYLUM" >&2
+  if [[ ! -f "$ASM/truth_all.tsv" ]]; then
+    echo "[error] truth_all.tsv missing at $ASM/truth_all.tsv for $PHYLUM" >&2
     exit 1
   fi
 
-  echo "[info] Converting truth.tsv -> truth.refcoords.vcf (reference-coordinates)"
-  python3 "$TRUTH_LIFT" "ref.fa" "$ASM/truth.tsv" "$OUT/truth.refcoords.vcf"
+  echo "[info] Converting truth_all.tsv -> truth.refcoords.vcf"
+  python3 "$TRUTH_LIFT" "ref.fa" "$ASM/truth_all.tsv" "$OUT/truth.refcoords.vcf"
 
-  echo "[info] Running caller (main.cpp) -> out.vcf"
+  echo "[info] Running caller -> out.vcf"
   "$BIN" \
     --ref "$OUT/ref.fa" \
     --asm-dir "$ASM" \
@@ -635,6 +627,10 @@ for row in "${PHYLUMS[@]}"; do
     --min-seeds "$MIN_SEEDS" \
     --top-contigs "$TOP_CONTIGS" \
     --min-contig 1 \
+    --candidates "$CANDIDATES" \
+    --mapq-ratio "$MAPQ_RATIO" \
+    --split-map "$SPLIT_MAP" \
+    --vcf-checkpoint "$VCF_CHECKPOINT" \
     > "$OUT/stdout.log" 2> "$OUT/stderr.log" || true
 
   if [[ ! -f "$OUT/out.vcf" ]]; then
@@ -658,3 +654,4 @@ for row in "${PHYLUMS[@]}"; do
 done
 
 echo "[done] Summary written to: $ROOT_OUT/metrics.tsv"
+
