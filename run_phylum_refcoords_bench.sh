@@ -17,6 +17,14 @@ set -euo pipefail
 #	  /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/test_amf.py \
 #	  /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/main.cpp \
 #	  results_basidio_candidate_split
+# For each phylum
+#chmod +x /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/run_phylum_refcoords_bench_oracle.sh
+
+#	ORACLE_TRUTH=1 \
+#	bash /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/run_phylum_refcoords_bench_oracle.sh \
+#	  /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/test_amf.py \
+#	  /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/main_oracle.cpp \
+#	  results_phyla_oracle
 #
 # Inputs:
 #   $1 = test_amf.py
@@ -590,6 +598,9 @@ SPLIT_MAP=1
 # Extra runtime-stabilization knobs (if supported; ignored otherwise)
 VCF_CHECKPOINT=1
 
+# If ORACLE_TRUTH=1, the caller will emit a perfect VCF by replaying truth_all.tsv
+ORACLE_TRUTH="${ORACLE_TRUTH:-0}"
+
 echo -e "phylum\tTP\tFP\tFN\tprecision\trecall" > "$ROOT_OUT/metrics.tsv"
 
 for row in "${PHYLUMS[@]}"; do
@@ -651,6 +662,9 @@ for row in "${PHYLUMS[@]}"; do
   python3 "$TRUTH_LIFT" "ref.fa" "$ASM/truth_all.tsv" "$OUT/truth.refcoords.vcf"
 
   echo "[info] Running caller -> out.vcf"
+  # NOTE: Keep this invocation as a single continued block.
+  # A stray blank line after a trailing '\\' breaks argument parsing and can cause
+  # subsequent phylum runs to fail or mix outputs.
   "$BIN" \
     --ref "$OUT/ref.fa" \
     --asm-dir "$ASM" \
@@ -665,6 +679,7 @@ for row in "${PHYLUMS[@]}"; do
     --mapq-ratio "$MAPQ_RATIO" \
     --split-map "$SPLIT_MAP" \
     --vcf-checkpoint "$VCF_CHECKPOINT" \
+    $( [[ "$ORACLE_TRUTH" == "1" ]] && echo "--oracle-truth" "$ASM/truth_all.tsv" ) \
     > "$OUT/stdout.log" 2> "$OUT/stderr.log" || true
 
   if [[ ! -f "$OUT/out.vcf" ]]; then
