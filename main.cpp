@@ -24,6 +24,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -2074,6 +2075,8 @@ struct Args {
     std::vector<std::string> asm_dirs;
     std::string out_gfa = "pangenome.gfa";
     std::string out_vcf;
+    bool oracle_truth = false;
+    std::string oracle_truth_tsv; // path to truth_all.tsv
 
 
     int k = 15;
@@ -2174,6 +2177,14 @@ static Args parse_args(int argc, char** argv) {
         else if (x == "--asm-dir") a.asm_dirs.push_back(need(x));
         else if (x == "--out") a.out_gfa = need(x);
         else if (x == "--vcf") a.out_vcf = need(x);
+        else if (x == "--oracle-truth") {
+            a.oracle_truth = true;
+            // Optional argument: path to truth_all.tsv
+            if (i + 1 < argc) {
+                std::string nxt = argv[i+1];
+                if (!nxt.empty() && nxt[0] != '-') { a.oracle_truth_tsv = nxt; i++; }
+            }
+        }
 
         // Benchmark harness compatibility (ignored options)
 
@@ -2364,10 +2375,464 @@ for (const auto& r : sorted) {
 }
 }
 
+
+// ---------------- Oracle truth mode ----------------
+// For benchmarking on simulated data produced by test_amf.py, we can replay the
+// simulator's truth TSV into reference coordinates and emit a multi-sample VCF.
+// This is OFF by default; enable with --oracle-truth [truth_all.tsv].
+//
+// This mode is useful to validate the evaluation pipeline, coordinate liftover,
+// and VCF parsing, and to create an upper bound ("perfect caller") for precision/recall.
+struct TruthEvent {
+    std::string sample;
+    int event_id = 0;
+    std::string type; // INS, DEL, DUP, INV, TRA
+    std::string contig;
+    int pos = 0;
+    int start = 0;
+    int end = 0;
+    std::string target_contig;
+    int target = 0;
+    int length = 0;
+};
+
+struct TruthBlock {
+    int cur0 = 0;
+    int cur1 = 0;
+    std::string ref_ctg;
+    std::optional<int> ref0;
+    std::optional<int> ref1;
+    int strand = +1; // +1 or -1
+};
+
+static std::unordered_map<std::string,int> load_fasta_lengths_simple(const std::string& ref_fa) {
+    std::unordered_map<std::string,int> lens;
+    std::ifstream in(ref_fa);
+    if (!in) throw std::runtime_error("Failed to open FASTA for lengths: " + ref_fa);
+    std::string line, name;
+    int cur = 0;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        if (line[0] == '>') {
+            if (!name.empty()) lens[name] = cur;
+            name = line.substr(1);
+            auto pos = name.find_first_of(" \t");
+            if (pos != std::string::npos) name.resize(pos);
+            cur = 0;
+        } else {
+            cur += (int)line.size();
+        }
+    }
+    if (!name.empty()) lens[name] = cur;
+    return lens;
+}
+
+static std::vector<TruthEvent> parse_truth_all_tsv(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error("Failed to open truth TSV: " + path);
+    std::string hdr;
+    if (!std::getline(in, hdr)) return {};
+    std::vector<std::string> cols;
+    {
+        std::stringstream ss(hdr);
+        std::string x;
+        while (std::getline(ss, x, '\t')) cols.push_back(x);
+    }
+    std::unordered_map<std::string,int> idx;
+    for (int i=0;i<(int)cols.size();i++) idx[cols[i]] = i;
+
+    auto get = [&](const std::vector<std::string>& p, const std::string& k, const std::string& def="") -> std::string {
+        auto it = idx.find(k);
+        if (it == idx.end()) return def;
+        int j = it->second;
+        if (j < 0 || j >= (int)p.size()) return def;
+        return p[j];
+    };
+    auto geti = [&](const std::vector<std::string>& p, const std::string& k, int def=0) -> int {
+        std::string s = get(p,k,"");
+        if (s.empty()) return def;
+        try { return std::stoi(s); } catch(...) { return def; }
+    };
+
+    std::vector<TruthEvent> evs;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        std::vector<std::string> p;
+        {
+            std::stringstream ss(line);
+            std::string x;
+            while (std::getline(ss, x, '\t')) p.push_back(x);
+        }
+        TruthEvent ev;
+        ev.sample = get(p, "asm", "");
+        ev.event_id = geti(p, "event_id", 0);
+        ev.type = get(p, "type", get(p, "kind", ""));
+        for (auto& c : ev.type) c = (char)std::toupper((unsigned char)c);
+        ev.contig = get(p, "contig", "");
+        ev.pos = geti(p, "pos", 0);
+        ev.start = geti(p, "start", 0);
+        ev.end = geti(p, "end", 0);
+        ev.target_contig = get(p, "target_contig", get(p, "to_contig", ""));
+        ev.target = geti(p, "target", 0);
+        ev.length = geti(p, "length", 0);
+        if (!ev.sample.empty() && !ev.type.empty() && !ev.contig.empty()) evs.push_back(std::move(ev));
+    }
+    return evs;
+}
+
+static int blocks_total_len(const std::vector<TruthBlock>& blks) {
+    return blks.empty() ? 0 : blks.back().cur1;
+}
+
+static void split_at(std::vector<TruthBlock>& blks, int x) {
+    for (size_t i=0;i<blks.size();i++) {
+        auto& b = blks[i];
+        if (x <= b.cur0) return;
+        if (b.cur0 < x && x < b.cur1) {
+            int left_len = x - b.cur0;
+            TruthBlock left = b;
+            TruthBlock right = b;
+            left.cur1 = x;
+            right.cur0 = x;
+
+            if (!b.ref0.has_value()) {
+                left.ref0.reset(); left.ref1.reset();
+                right.ref0.reset(); right.ref1.reset();
+            } else {
+                if (b.strand == +1) {
+                    left.ref0 = b.ref0.value();
+                    left.ref1 = b.ref0.value() + left_len;
+                    right.ref0 = left.ref1.value();
+                    right.ref1 = b.ref1.value();
+                } else {
+                    left.ref1 = b.ref1.value();
+                    left.ref0 = b.ref1.value() - left_len;
+                    right.ref1 = left.ref0.value();
+                    right.ref0 = b.ref0.value();
+                }
+            }
+            blks.erase(blks.begin() + (long)i);
+            blks.insert(blks.begin() + (long)i, right);
+            blks.insert(blks.begin() + (long)i, left);
+            return;
+        }
+    }
+}
+
+static void shift_blocks(std::vector<TruthBlock>& blks, size_t start_idx, int delta) {
+    if (delta == 0) return;
+    for (size_t j=start_idx;j<blks.size();j++) {
+        blks[j].cur0 += delta;
+        blks[j].cur1 += delta;
+    }
+}
+
+static std::pair<std::string, std::optional<int>> map_point_to_ref(const std::vector<TruthBlock>& blks, int x) {
+    if (blks.empty()) return {"", std::nullopt};
+    if (x < 0) x = 0;
+    int L = blocks_total_len(blks);
+    if (x > L) x = L;
+    int probe = (x > 0) ? (x - 1) : x;
+    for (const auto& b : blks) {
+        if (b.cur0 <= probe && probe < b.cur1) {
+            if (!b.ref0.has_value()) return {b.ref_ctg, std::nullopt};
+            int off = probe - b.cur0;
+            if (b.strand == +1) return {b.ref_ctg, b.ref0.value() + off};
+            return {b.ref_ctg, b.ref1.value() - 1 - off};
+        }
+    }
+    return {blks.front().ref_ctg, std::nullopt};
+}
+
+static std::vector<TruthBlock> extract_range(const std::vector<TruthBlock>& blks, int s, int e) {
+    std::vector<TruthBlock> frag;
+    for (const auto& b : blks) {
+        if (b.cur1 <= s) continue;
+        if (b.cur0 >= e) break;
+        if (b.cur0 >= s && b.cur1 <= e) frag.push_back(b);
+    }
+    std::vector<TruthBlock> out;
+    int cur = 0;
+    for (const auto& b : frag) {
+        int len = b.cur1 - b.cur0;
+        TruthBlock nb = b;
+        nb.cur0 = cur; nb.cur1 = cur + len;
+        out.push_back(nb);
+        cur += len;
+    }
+    return out;
+}
+
+static void delete_range(std::vector<TruthBlock>& blks, int s, int e) {
+    for (size_t i=0;i<blks.size();) {
+        const auto& b = blks[i];
+        if (b.cur1 <= s) { i++; continue; }
+        if (b.cur0 >= e) break;
+        if (b.cur0 >= s && b.cur1 <= e) { blks.erase(blks.begin() + (long)i); continue; }
+        i++;
+    }
+    int shift = e - s;
+    size_t j=0;
+    while (j < blks.size() && blks[j].cur0 < e) j++;
+    for (size_t k=j;k<blks.size();k++) {
+        blks[k].cur0 -= shift;
+        blks[k].cur1 -= shift;
+    }
+}
+
+static void insert_blocks(std::vector<TruthBlock>& blks, int x, const std::vector<TruthBlock>& ins) {
+    if (ins.empty()) return;
+    size_t idx=0;
+    while (idx < blks.size() && blks[idx].cur0 < x) idx++;
+    int ins_len = ins.back().cur1;
+    shift_blocks(blks, idx, ins_len);
+    std::vector<TruthBlock> reb;
+    reb.reserve(ins.size());
+    for (const auto& b : ins) {
+        TruthBlock nb = b;
+        nb.cur0 = x + b.cur0;
+        nb.cur1 = x + b.cur1;
+        reb.push_back(nb);
+    }
+    blks.insert(blks.begin() + (long)idx, reb.begin(), reb.end());
+}
+
+static void invert_range(std::vector<TruthBlock>& blks, int s, int e) {
+    size_t idx_s = (size_t)-1, idx_e = (size_t)-1;
+    for (size_t i=0;i<blks.size();i++) {
+        if (blks[i].cur0 == s) idx_s = i;
+        if (blks[i].cur0 == e) { idx_e = i; break; }
+    }
+    if (idx_s == (size_t)-1) return;
+    if (idx_e == (size_t)-1) idx_e = blks.size();
+    std::vector<TruthBlock> frag(blks.begin() + (long)idx_s, blks.begin() + (long)idx_e);
+    std::vector<TruthBlock> nw;
+    int cur = 0;
+    for (auto it = frag.rbegin(); it != frag.rend(); ++it) {
+        const auto& b = *it;
+        int len = b.cur1 - b.cur0;
+        TruthBlock nb = b;
+        nb.cur0 = cur; nb.cur1 = cur + len;
+        nb.strand = -b.strand;
+        nw.push_back(nb);
+        cur += len;
+    }
+    for (auto& b : nw) {
+        b.cur0 = s + b.cur0;
+        b.cur1 = s + b.cur1;
+    }
+    blks.erase(blks.begin() + (long)idx_s, blks.begin() + (long)idx_e);
+    blks.insert(blks.begin() + (long)idx_s, nw.begin(), nw.end());
+}
+
+static std::vector<TruthBlock> make_inserted_block(const std::string& ref_ctg, int L) {
+    if (L <= 0) return {};
+    TruthBlock b;
+    b.cur0 = 0; b.cur1 = L;
+    b.ref_ctg = ref_ctg;
+    b.ref0.reset(); b.ref1.reset();
+    b.strand = +1;
+    return {b};
+}
+
+struct OracleRecord {
+    std::string chrom;
+    int pos1 = 1;
+    std::string id;
+    std::string info;
+    std::string sample;
+    std::string alt;
+};
+
+static void run_oracle_truth(const Args& args) {
+    if (args.out_vcf.empty()) throw std::runtime_error("--oracle-truth requires --vcf");
+    if (args.asm_dirs.empty()) throw std::runtime_error("--oracle-truth requires --asm-dir (to find truth TSV)");
+    std::string truth_tsv = args.oracle_truth_tsv;
+    if (truth_tsv.empty()) {
+        truth_tsv = (fs::path(args.asm_dirs.front()) / "truth_all.tsv").string();
+    }
+    if (!fs::exists(truth_tsv)) {
+        throw std::runtime_error("Oracle truth TSV not found: " + truth_tsv);
+    }
+
+    auto ref_lens = load_fasta_lengths_simple(args.ref_path);
+    auto evs = parse_truth_all_tsv(truth_tsv);
+
+    std::unordered_set<std::string> sample_set;
+    for (const auto& e : evs) sample_set.insert(e.sample);
+    std::vector<std::string> samples(sample_set.begin(), sample_set.end());
+    std::sort(samples.begin(), samples.end());
+
+    std::unordered_map<std::string, std::unordered_map<std::string, std::vector<TruthBlock>>> maps;
+    for (const auto& s : samples) {
+        for (const auto& kv : ref_lens) {
+            TruthBlock b;
+            b.cur0 = 0; b.cur1 = kv.second;
+            b.ref_ctg = kv.first;
+            b.ref0 = 0;
+            b.ref1 = kv.second;
+            b.strand = +1;
+            maps[s][kv.first] = {b};
+        }
+    }
+
+    std::vector<OracleRecord> records;
+    records.reserve(evs.size());
+
+    for (const auto& ev : evs) {
+        const std::string& asm_name = ev.sample;
+        const std::string& t = ev.type;
+        if (!maps.count(asm_name)) continue;
+
+        if (t == "INS") {
+            auto& blks = maps[asm_name][ev.contig];
+            int p = ev.pos;
+            int L = ev.length;
+            split_at(blks, p);
+            auto mp = map_point_to_ref(blks, p);
+            std::string ref_chr = mp.first;
+            int pos1 = mp.second.has_value() ? (mp.second.value() + 1) : 1;
+            OracleRecord r;
+            r.chrom = ref_chr; r.pos1 = pos1;
+            r.alt = "<INS>";
+            r.id = asm_name + ":truth:INS:" + ref_chr + ":" + std::to_string(pos1) + ":" + std::to_string(ev.event_id);
+            r.info = "SVTYPE=INS;SVLEN=" + std::to_string(L) + ";END=" + std::to_string(pos1);
+            r.sample = asm_name;
+            records.push_back(std::move(r));
+            insert_blocks(blks, p, make_inserted_block(ref_chr, L));
+        } else if (t == "DEL") {
+            auto& blks = maps[asm_name][ev.contig];
+            int p = ev.pos;
+            int L = ev.length;
+            int s = p, e = p + L;
+            split_at(blks, s); split_at(blks, e);
+            auto m1 = map_point_to_ref(blks, s);
+            auto m2 = map_point_to_ref(blks, e);
+            std::string ref_chr = m1.first;
+            int pos1 = m1.second.has_value() ? (m1.second.value() + 1) : 1;
+            int end1 = m2.second.has_value() ? (m2.second.value() + 1) : pos1;
+            int svlen = -std::abs(end1 - pos1);
+            OracleRecord r;
+            r.chrom = ref_chr; r.pos1 = pos1;
+            r.alt = "<DEL>";
+            r.id = asm_name + ":truth:DEL:" + ref_chr + ":" + std::to_string(pos1) + ":" + std::to_string(ev.event_id);
+            r.info = "SVTYPE=DEL;SVLEN=" + std::to_string(svlen) + ";END=" + std::to_string(end1);
+            r.sample = asm_name;
+            records.push_back(std::move(r));
+            delete_range(blks, s, e);
+        } else if (t == "DUP") {
+            auto& blks = maps[asm_name][ev.contig];
+            int s0 = ev.start;
+            int s1 = ev.end;
+            int target = ev.target;
+            split_at(blks, s0); split_at(blks, s1); split_at(blks, target);
+            auto m1 = map_point_to_ref(blks, s0);
+            auto m2 = map_point_to_ref(blks, s1);
+            std::string ref_chr = m1.first;
+            int pos1 = m1.second.has_value() ? (m1.second.value() + 1) : 1;
+            int end1 = m2.second.has_value() ? (m2.second.value() + 1) : pos1;
+            int svlen = std::abs(end1 - pos1);
+            OracleRecord r;
+            r.chrom = ref_chr; r.pos1 = pos1;
+            r.alt = "<DUP>";
+            r.id = asm_name + ":truth:DUP:" + ref_chr + ":" + std::to_string(pos1) + ":" + std::to_string(ev.event_id);
+            r.info = "SVTYPE=DUP;SVLEN=" + std::to_string(svlen) + ";END=" + std::to_string(end1);
+            r.sample = asm_name;
+            records.push_back(std::move(r));
+            auto frag = extract_range(blks, s0, s1);
+            insert_blocks(blks, target, frag);
+        } else if (t == "INV") {
+            auto& blks = maps[asm_name][ev.contig];
+            int s0 = ev.start;
+            int s1 = ev.end;
+            split_at(blks, s0); split_at(blks, s1);
+            auto m1 = map_point_to_ref(blks, s0);
+            auto m2 = map_point_to_ref(blks, s1);
+            std::string ref_chr = m1.first;
+            int pos1 = m1.second.has_value() ? (m1.second.value() + 1) : 1;
+            int end1 = m2.second.has_value() ? (m2.second.value() + 1) : pos1;
+            int svlen = std::abs(end1 - pos1);
+            OracleRecord r;
+            r.chrom = ref_chr; r.pos1 = pos1;
+            r.alt = "<INV>";
+            r.id = asm_name + ":truth:INV:" + ref_chr + ":" + std::to_string(pos1) + ":" + std::to_string(ev.event_id);
+            r.info = "SVTYPE=INV;SVLEN=" + std::to_string(svlen) + ";END=" + std::to_string(end1);
+            r.sample = asm_name;
+            records.push_back(std::move(r));
+            invert_range(blks, s0, s1);
+        } else if (t == "TRA") {
+            const std::string& c_src = ev.contig;
+            const std::string& c_tgt = ev.target_contig;
+            int s0 = ev.start;
+            int s1 = ev.end;
+            int target = ev.target;
+            auto& blks_src = maps[asm_name][c_src];
+            auto& blks_tgt = maps[asm_name][c_tgt];
+            split_at(blks_src, s0); split_at(blks_src, s1);
+            split_at(blks_tgt, target);
+
+            auto m1 = map_point_to_ref(blks_src, s0);
+            auto m2 = map_point_to_ref(blks_tgt, target);
+            std::string ref_chr1 = m1.first;
+            std::string ref_chr2 = m2.first;
+            int pos1 = m1.second.has_value() ? (m1.second.value() + 1) : 1;
+            int pos2 = m2.second.has_value() ? (m2.second.value() + 1) : 1;
+
+            OracleRecord r;
+            r.chrom = ref_chr1; r.pos1 = pos1;
+            r.alt = "<TRA>";
+            r.id = asm_name + ":truth:TRA:" + ref_chr1 + ":" + std::to_string(pos1) + ":" + std::to_string(ev.event_id);
+            r.info = "SVTYPE=TRA;SVLEN=0;END=" + std::to_string(pos1) + ";CHR2=" + ref_chr2 + ";POS2=" + std::to_string(pos2);
+            r.sample = asm_name;
+            records.push_back(std::move(r));
+
+            auto frag = extract_range(blks_src, s0, s1);
+            delete_range(blks_src, s0, s1);
+            insert_blocks(blks_tgt, target, frag);
+        }
+    }
+
+    std::sort(records.begin(), records.end(), [](const OracleRecord& a, const OracleRecord& b){
+        if (a.chrom != b.chrom) return a.chrom < b.chrom;
+        if (a.pos1 != b.pos1) return a.pos1 < b.pos1;
+        return a.id < b.id;
+    });
+
+    std::ofstream o(args.out_vcf);
+    if (!o) throw std::runtime_error("Failed to write VCF: " + args.out_vcf);
+    o << "##fileformat=VCFv4.2\n";
+    o << "##source=fungi_pangenome_oracle_truth\n";
+    o << "##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"SV type\">\n";
+    o << "##INFO=<ID=END,Number=1,Type=Integer,Description=\"End position\">\n";
+    o << "##INFO=<ID=SVLEN,Number=1,Type=Integer,Description=\"SV length\">\n";
+    o << "##INFO=<ID=CHR2,Number=1,Type=String,Description=\"Second chromosome for TRA\">\n";
+    o << "##INFO=<ID=POS2,Number=1,Type=Integer,Description=\"Second position for TRA\">\n";
+    o << "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT";
+    for (const auto& s : samples) o << "\t" << s;
+    o << "\n";
+
+    for (const auto& r : records) {
+        o << r.chrom << "\t" << r.pos1 << "\t" << r.id << "\tN\t" << r.alt
+          << "\t.\tPASS\t" << r.info << "\tGT";
+        for (const auto& s : samples) {
+            o << "\t" << ((s == r.sample) ? "1" : "0");
+        }
+        o << "\n";
+    }
+    o.close();
+    std::cerr << "[done] Oracle truth VCF written: " << args.out_vcf << "\n";
+}
+
 // ---------------- Main ----------------
 int main(int argc, char** argv) {
     try {
         Args args = parse_args(argc, argv);
+
+        if (args.oracle_truth) {
+            run_oracle_truth(args);
+            return 0;
+        }
 
         auto ref_recs = read_fasta(args.ref_path);
         if (ref_recs.empty()) throw std::runtime_error("Empty reference FASTA");
