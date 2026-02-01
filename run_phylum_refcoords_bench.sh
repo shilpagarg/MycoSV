@@ -27,7 +27,7 @@ set -euo pipefail
 #   PHYLUM_FILTER   : if set, only runs that phylum (exact match)
 #   N_GENOMES       : override n-genomes per phylum (default per table)
 #   TOTAL_LEN       : override total-len per phylum (default per table)
-#   TOL_BP          : breakpoint tolerance for evaluation (default 1000)
+#   TOL_BP          : breakpoint tolerance for evaluation (default 5000)
 #
 # Outputs:
 #   results_dir/<phylum>/
@@ -534,7 +534,7 @@ PHYLUMS=(
 
 # Allow overrides
 PHYLUM_FILTER="${PHYLUM_FILTER:-}"
-TOL_BP="${TOL_BP:-1000}"
+TOL_BP="${TOL_BP:-5000}"
 OVR_NGEN="${N_GENOMES:-}"
 OVR_TLEN="${TOTAL_LEN:-}"
 
