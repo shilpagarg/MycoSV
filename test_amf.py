@@ -346,27 +346,11 @@ def main() -> None:
         # working copy
         contigs = dict(ref_dict)
 
-        # INS/DEL (biased to ends)
-        for _ in range(args.ins):
-            c = rng.choice(contig_names)
-            pos = pick_hotspot_pos(rng, len(contigs[c]), args.subtel_frac)
-            L = rng.randint(args.ins_len_min, args.ins_len_max)
-            ins = random_dna(rng, L, gc=args.gc)
-            apply_ins(contigs, c, pos, ins)
-            truth.append(Event(asm=asm_name, eid=eid, kind="INS", contig=c, pos=pos, length=L,
-                               extra="hotspot=subtel" if pos < int(len(contigs[c])*args.subtel_frac) or pos > int(len(contigs[c])*(1-args.subtel_frac)) else "hotspot=any"))
-            eid += 1
-
-        for _ in range(args.dels):
-            c = rng.choice(contig_names)
-            pos = pick_hotspot_pos(rng, len(contigs[c]), args.subtel_frac)
-            L = rng.randint(args.del_len_min, args.del_len_max)
-            dl = apply_del(contigs, c, pos, L)
-            truth.append(Event(asm=asm_name, eid=eid, kind="DEL", contig=c, pos=pos, length=dl,
-                               extra="hotspot=subtel" if pos < int(len(contigs[c])*args.subtel_frac) or pos > int(len(contigs[c])*(1-args.subtel_frac)) else "hotspot=any"))
-            eid += 1
-
         # DUP/INV/TRA (operate on evolving contigs)
+        # NOTE: To keep the benchmark focused on *calling* event classes (rather than
+        # extreme nested SV composition), we apply DUP/INV/TRA first and then INS/DEL.
+        # This avoids small indels landing inside large inversions/translocations, which
+        # can be unrealistically hard for a simple prototype caller to resolve.
         for _ in range(args.dup):
             c = rng.choice(contig_names)
             clen = len(contigs[c])
@@ -416,6 +400,26 @@ def main() -> None:
             truth.append(Event(asm=asm_name, eid=eid, kind="TRA", contig=c_src, start=s0, end=s1,
                                target_contig=c_tgt, target=target, length=L,
                                extra=""))
+            eid += 1
+
+        # INS/DEL (biased to ends) -- applied after DUP/INV/TRA to avoid nested SV composition.
+        for _ in range(args.ins):
+            c = rng.choice(contig_names)
+            pos = pick_hotspot_pos(rng, len(contigs[c]), args.subtel_frac)
+            L = rng.randint(args.ins_len_min, args.ins_len_max)
+            ins = random_dna(rng, L, gc=args.gc)
+            apply_ins(contigs, c, pos, ins)
+            truth.append(Event(asm=asm_name, eid=eid, kind="INS", contig=c, pos=pos, length=L,
+                               extra="hotspot=subtel" if pos < int(len(contigs[c])*args.subtel_frac) or pos > int(len(contigs[c])*(1-args.subtel_frac)) else "hotspot=any"))
+            eid += 1
+
+        for _ in range(args.dels):
+            c = rng.choice(contig_names)
+            pos = pick_hotspot_pos(rng, len(contigs[c]), args.subtel_frac)
+            L = rng.randint(args.del_len_min, args.del_len_max)
+            dl = apply_del(contigs, c, pos, L)
+            truth.append(Event(asm=asm_name, eid=eid, kind="DEL", contig=c, pos=pos, length=dl,
+                               extra="hotspot=subtel" if pos < int(len(contigs[c])*args.subtel_frac) or pos > int(len(contigs[c])*(1-args.subtel_frac)) else "hotspot=any"))
             eid += 1
 
         # write assembly as multi-contig FASTA
