@@ -263,15 +263,27 @@ def apply_tra(contigs: Dict[str,str], c_src: str, s0: int, s1: int, c_tgt: str, 
     target = min(target, len(tgt))
     contigs[c_tgt] = tgt[:target] + frag + tgt[target:]
 
+
 # ----------------------------
-# Simulation driver
+# Simulation driver (streaming; scales to thousands of genomes)
 # ----------------------------
+def _write_truth_header(fh) -> None:
+    fh.write("\t".join(["asm","event_id","type","contig","pos","start","end","target_contig","target","length","extra"]) + "\n")
+
+def _write_truth_event(fh, ev: Event) -> None:
+    fh.write("\t".join([
+        ev.asm, str(ev.eid), ev.kind, ev.contig,
+        str(ev.pos), str(ev.start), str(ev.end),
+        ev.target_contig, str(ev.target), str(ev.length),
+        ev.extra
+    ]) + "\n")
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description="AMF-style toy SV simulator (small genomes).")
+    ap = argparse.ArgumentParser(description="AMF-style toy SV simulator (supports thousands of genomes efficiently).")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--outdir", type=str, default="assemblies")
 
-    # Size and contigs (keep small for testing)
+    # Size and contigs
     ap.add_argument("--total-len", type=int, default=100_000, help="total genome length across contigs (default: 100k)")
     ap.add_argument("--n-contigs", type=int, default=10, help="number of contigs (default: 10)")
     ap.add_argument("--gc", type=float, default=0.35, help="GC fraction (default: 0.35; AMF-ish AT-rich)")
@@ -288,18 +300,31 @@ def main() -> None:
 
     # Assemblies
     ap.add_argument("--n-genomes", type=int, default=1000)
+    ap.add_argument("--start-idx", type=int, default=0, help="start index for assembly names (useful for batching)")
     ap.add_argument("--prefix", type=str, default="asm_")
     ap.add_argument("--digits", type=int, default=4)
-    ap.add_argument("--manifest", action="store_true")
 
-    # SV counts per assembly (per-genome totals, distributed across contigs)
+    # Truth/manifest outputs (streaming)
+    ap.add_argument("--truth-all-mode", choices=["write","append","none"], default="write",
+                    help="combined truth file mode for <outdir>/truth_all.tsv (default: write). Use 'none' for fastest runs.")
+    ap.add_argument("--per-asm-truth", action="store_true", default=True,
+                    help="write <outdir>/<asm>.truth.tsv for each genome (default: on)")
+    ap.add_argument("--no-per-asm-truth", dest="per_asm_truth", action="store_false",
+                    help="disable per-assembly truth files")
+    ap.add_argument("--manifest", action="store_true", help="write <outdir>/manifest.tsv (streamed)")
+    ap.add_argument("--manifest-positions", action="store_true",
+                    help="include compact position strings in manifest (can be large; off by default)")
+    ap.add_argument("--ref-out", type=str, default="ref.fa",
+                    help="where to write the reference FASTA (default: ref.fa in current working directory)")
+
+    # SV counts per assembly
     ap.add_argument("--ins", type=int, default=2)
     ap.add_argument("--del", dest="dels", type=int, default=2)
     ap.add_argument("--dup", type=int, default=1)
     ap.add_argument("--inv", type=int, default=1)
     ap.add_argument("--tra", type=int, default=1)
 
-    # SV size ranges (kept small)
+    # SV size ranges
     ap.add_argument("--ins-len-min", type=int, default=100)
     ap.add_argument("--ins-len-max", type=int, default=1200)
     ap.add_argument("--del-len-min", type=int, default=100)
@@ -332,25 +357,90 @@ def main() -> None:
         repeat_lib=repeat_lib
     )
 
-    write_fasta_multi("ref.fa", ref_contigs)
+    # Write reference (explicit destination)
+    write_fasta_multi(args.ref_out, ref_contigs)
 
     # Base reference dict (for per-assembly copy)
     ref_dict: Dict[str,str] = {name: seq for name, seq in ref_contigs}
     contig_names = [name for name, _ in ref_contigs]
 
-    truth: List[Event] = []
+    # Open combined truth file (optional), streaming
+    truth_all_fh = None
+    truth_all_path = os.path.join(args.outdir, "truth_all.tsv")
+    if args.truth_all_mode != "none":
+        mode = "w" if args.truth_all_mode == "write" else "a"
+        first_write = (mode == "w") or (not os.path.exists(truth_all_path)) or (os.path.getsize(truth_all_path) == 0)
+        truth_all_fh = open(truth_all_path, mode)
+        if first_write:
+            _write_truth_header(truth_all_fh)
+
+    # Open manifest (optional), streaming
+    manifest_fh = None
+    if args.manifest:
+        mpath = os.path.join(args.outdir, "manifest.tsv")
+        manifest_fh = open(mpath, "w")
+        # Keep manifest compact by default for large N
+        cols = [
+            "asm","fasta_path","ref_path","truth_path","truth_all_path",
+            "n_INS","n_DEL","n_DUP","n_INV","n_TRA","n_SV_total"
+        ]
+        if args.manifest_positions:
+            cols += ["INS_pos","DEL_pos","DUP_pos","INV_pos","TRA_pos"]
+        manifest_fh.write("\t".join(cols) + "\n")
+
+    outdir_abs = os.path.abspath(args.outdir)
+    ref_abs = os.path.abspath(args.ref_out)
+    truth_all_abs = os.path.abspath(truth_all_path) if args.truth_all_mode != "none" else ""
+
     eid = 1
 
-    for i in range(args.n_genomes):
+    def sort_key(tok: str):
+        contig, rest = tok.split(":", 1)
+        num = 0
+        m = re.search(r"(\d+)", rest)
+        if m: num = int(m.group(1))
+        return (contig, num, rest)
+
+    for i in range(args.start_idx, args.start_idx + args.n_genomes):
         asm_name = f"{args.prefix}{i:0{args.digits}d}"
-        # working copy
+
+        # Working copy per genome
         contigs = dict(ref_dict)
 
-        # DUP/INV/TRA (operate on evolving contigs)
-        # NOTE: To keep the benchmark focused on *calling* event classes (rather than
-        # extreme nested SV composition), we apply DUP/INV/TRA first and then INS/DEL.
-        # This avoids small indels landing inside large inversions/translocations, which
-        # can be unrealistically hard for a simple prototype caller to resolve.
+        # Per-assembly truth file (optional)
+        per_truth_path = os.path.join(args.outdir, f"{asm_name}.truth.tsv")
+        per_truth_fh = None
+        if args.per_asm_truth:
+            per_truth_fh = open(per_truth_path, "w")
+            _write_truth_header(per_truth_fh)
+
+        # Per-genome manifest stats (streamed)
+        counts = {"INS":0,"DEL":0,"DUP":0,"INV":0,"TRA":0}
+        posbags = {"INS":[], "DEL":[], "DUP":[], "INV":[], "TRA":[]}
+
+        def emit(ev: Event):
+            nonlocal eid
+            # already has eid set by caller
+            if truth_all_fh is not None:
+                _write_truth_event(truth_all_fh, ev)
+            if per_truth_fh is not None:
+                _write_truth_event(per_truth_fh, ev)
+
+            if ev.kind in counts:
+                counts[ev.kind] += 1
+                if args.manifest_positions:
+                    if ev.kind == "INS":
+                        posbags["INS"].append(f"{ev.contig}:{ev.pos}({ev.length})")
+                    elif ev.kind == "DEL":
+                        posbags["DEL"].append(f"{ev.contig}:{ev.pos}({ev.length})")
+                    elif ev.kind == "DUP":
+                        posbags["DUP"].append(f"{ev.contig}:{ev.start}-{ev.end}")
+                    elif ev.kind == "INV":
+                        posbags["INV"].append(f"{ev.contig}:{ev.start}-{ev.end}")
+                    elif ev.kind == "TRA":
+                        posbags["TRA"].append(f"{ev.contig}:{ev.start}-{ev.end}->{ev.target_contig}:{ev.target}")
+
+        # Apply DUP/INV/TRA first (avoid nested composition)
         for _ in range(args.dup):
             c = rng.choice(contig_names)
             clen = len(contigs[c])
@@ -360,14 +450,13 @@ def main() -> None:
             s0 = pick_hotspot_pos(rng, clen - L, args.subtel_frac)
             s0 = min(s0, clen - L)
             s1 = s0 + L
-            # target biased to nearby (tandem-like) with 60% prob
             if rng.random() < 0.60:
                 target = min(clen, s1 + rng.randint(0, 2000))
             else:
                 target = rng.randint(0, clen)
             apply_dup(contigs, c, s0, s1, target)
-            truth.append(Event(asm=asm_name, eid=eid, kind="DUP", contig=c, start=s0, end=s1, target=target, length=L,
-                               extra="mode=tandem" if target >= s1 and target <= s1+2000 else "mode=dispersed"))
+            emit(Event(asm=asm_name, eid=eid, kind="DUP", contig=c, start=s0, end=s1, target=target, length=L,
+                       extra="mode=tandem" if target >= s1 and target <= s1+2000 else "mode=dispersed"))
             eid += 1
 
         for _ in range(args.inv):
@@ -380,8 +469,7 @@ def main() -> None:
             s0 = min(s0, clen - L)
             s1 = s0 + L
             apply_inv(contigs, c, s0, s1)
-            truth.append(Event(asm=asm_name, eid=eid, kind="INV", contig=c, start=s0, end=s1, length=L,
-                               extra=""))
+            emit(Event(asm=asm_name, eid=eid, kind="INV", contig=c, start=s0, end=s1, length=L, extra=""))
             eid += 1
 
         for _ in range(args.tra):
@@ -397,20 +485,19 @@ def main() -> None:
             tgt_len = len(contigs[c_tgt])
             target = pick_hotspot_pos(rng, tgt_len, args.subtel_frac)
             apply_tra(contigs, c_src, s0, s1, c_tgt, target)
-            truth.append(Event(asm=asm_name, eid=eid, kind="TRA", contig=c_src, start=s0, end=s1,
-                               target_contig=c_tgt, target=target, length=L,
-                               extra=""))
+            emit(Event(asm=asm_name, eid=eid, kind="TRA", contig=c_src, start=s0, end=s1,
+                       target_contig=c_tgt, target=target, length=L, extra=""))
             eid += 1
 
-        # INS/DEL (biased to ends) -- applied after DUP/INV/TRA to avoid nested SV composition.
+        # INS/DEL after
         for _ in range(args.ins):
             c = rng.choice(contig_names)
             pos = pick_hotspot_pos(rng, len(contigs[c]), args.subtel_frac)
             L = rng.randint(args.ins_len_min, args.ins_len_max)
             ins = random_dna(rng, L, gc=args.gc)
             apply_ins(contigs, c, pos, ins)
-            truth.append(Event(asm=asm_name, eid=eid, kind="INS", contig=c, pos=pos, length=L,
-                               extra="hotspot=subtel" if pos < int(len(contigs[c])*args.subtel_frac) or pos > int(len(contigs[c])*(1-args.subtel_frac)) else "hotspot=any"))
+            emit(Event(asm=asm_name, eid=eid, kind="INS", contig=c, pos=pos, length=L,
+                       extra="hotspot=subtel" if pos < int(len(contigs[c])*args.subtel_frac) or pos > int(len(contigs[c])*(1-args.subtel_frac)) else "hotspot=any"))
             eid += 1
 
         for _ in range(args.dels):
@@ -418,191 +505,52 @@ def main() -> None:
             pos = pick_hotspot_pos(rng, len(contigs[c]), args.subtel_frac)
             L = rng.randint(args.del_len_min, args.del_len_max)
             dl = apply_del(contigs, c, pos, L)
-            truth.append(Event(asm=asm_name, eid=eid, kind="DEL", contig=c, pos=pos, length=dl,
-                               extra="hotspot=subtel" if pos < int(len(contigs[c])*args.subtel_frac) or pos > int(len(contigs[c])*(1-args.subtel_frac)) else "hotspot=any"))
+            emit(Event(asm=asm_name, eid=eid, kind="DEL", contig=c, pos=pos, length=dl,
+                       extra="hotspot=subtel" if pos < int(len(contigs[c])*args.subtel_frac) or pos > int(len(contigs[c])*(1-args.subtel_frac)) else "hotspot=any"))
             eid += 1
 
-        # write assembly as multi-contig FASTA
+        # Write assembly as multi-contig FASTA
         asm_contigs = [(c, contigs[c]) for c in contig_names]
         out_path = os.path.join(args.outdir, f"{asm_name}.fa")
         write_fasta_multi(out_path, asm_contigs)
 
-    # Write per-assembly truth files and a combined truth file
-    truth_all_path = os.path.join(args.outdir, "truth_all.tsv")
-    write_truth_tsv(truth_all_path, truth)
-    per = {}
-    for ev in truth:
-        per.setdefault(ev.asm, []).append(ev)
-    for asm_name, evs in per.items():
-        write_truth_tsv(os.path.join(args.outdir, f"{asm_name}.truth.tsv"), evs)
+        if per_truth_fh is not None:
+            per_truth_fh.close()
 
-    if args.manifest:
-        # Manifest includes per-assembly SV counts + compact positions (joinable to truth.tsv via 'asm').
-        # Positions are encoded as:
-        #   INS/DEL:  contig:pos(len)
-        #   DUP/INV:  contig:start-end
-        #   TRA:      contig:start-end->target_contig:target
-        # Columns:
-        #   asm, fasta_path, ref_path, truth_path,
-        #   n_INS, n_DEL, n_DUP, n_INV, n_TRA, n_SV_total,
-        #   INS_pos, DEL_pos, DUP_pos, INV_pos, TRA_pos
-        mpath = os.path.join(args.outdir, "manifest.tsv")
-        outdir_abs = os.path.abspath(args.outdir)
-        ref_abs = os.path.abspath("ref.fa")
-        truth_abs = os.path.abspath(os.path.join(args.outdir, "truth.tsv"))
-
-        # Aggregate per-assembly
-        agg = {}
-        for ev in truth:
-            a = agg.setdefault(ev.asm, {
-                "count": {"INS":0,"DEL":0,"DUP":0,"INV":0,"TRA":0},
-                "pos":   {"INS":[], "DEL":[], "DUP":[], "INV":[], "TRA":[]}
-            })
-            if ev.kind in a["count"]:
-                a["count"][ev.kind] += 1
-
-            if ev.kind == "INS":
-                a["pos"]["INS"].append(f"{ev.contig}:{ev.pos}({ev.length})")
-            elif ev.kind == "DEL":
-                a["pos"]["DEL"].append(f"{ev.contig}:{ev.pos}({ev.length})")
-            elif ev.kind == "DUP":
-                a["pos"]["DUP"].append(f"{ev.contig}:{ev.start}-{ev.end}")
-            elif ev.kind == "INV":
-                a["pos"]["INV"].append(f"{ev.contig}:{ev.start}-{ev.end}")
-            elif ev.kind == "TRA":
-                a["pos"]["TRA"].append(f"{ev.contig}:{ev.start}-{ev.end}->{ev.target_contig}:{ev.target}")
-
-        with open(mpath, "w") as mf:
-            mf.write(
-                "asm\tfasta_path\tref_path\ttruth_path"
-                "\tn_INS\tn_DEL\tn_DUP\tn_INV\tn_TRA\tn_SV_total"
-                "\tINS_pos\tDEL_pos\tDUP_pos\tINV_pos\tTRA_pos\n"
-            )
-
-            for i in range(args.n_genomes):
-                asm_name = f"{args.prefix}{i:0{args.digits}d}"
-                fasta_abs = os.path.join(outdir_abs, asm_name + ".fa")
-
-                a = agg.get(asm_name, {"count":{"INS":0,"DEL":0,"DUP":0,"INV":0,"TRA":0},
-                                       "pos":{"INS":[],"DEL":[],"DUP":[],"INV":[],"TRA":[]}})
-                c = a["count"]
-                total = c["INS"] + c["DEL"] + c["DUP"] + c["INV"] + c["TRA"]
-
-                # Compact, stable ordering (sort by contig then numeric position)
-                def sort_key(tok: str):
-                    # token starts with contig:...
-                    contig, rest = tok.split(":", 1)
-                    # extract first number in rest
-                    num = 0
-                    m = re.search(r"(\d+)", rest)
-                    if m: num = int(m.group(1))
-                    return (contig, num, rest)
-
+        # Stream manifest row
+        if manifest_fh is not None:
+            total = sum(counts.values())
+            row = [
+                asm_name,
+                os.path.join(outdir_abs, f"{asm_name}.fa"),
+                ref_abs,
+                os.path.join(outdir_abs, f"{asm_name}.truth.tsv") if args.per_asm_truth else "",
+                truth_all_abs,
+                str(counts["INS"]), str(counts["DEL"]), str(counts["DUP"]), str(counts["INV"]), str(counts["TRA"]), str(total),
+            ]
+            if args.manifest_positions:
                 def join_list(xs):
-                    xs2 = sorted(xs, key=sort_key)
-                    return ";".join(xs2)
+                    return ";".join(sorted(xs, key=sort_key))
+                row += [join_list(posbags["INS"]), join_list(posbags["DEL"]), join_list(posbags["DUP"]), join_list(posbags["INV"]), join_list(posbags["TRA"])]
+            manifest_fh.write("\t".join(row) + "\n")
 
-                mf.write(
-                    f"{asm_name}\t{fasta_abs}\t{ref_abs}\t{truth_abs}"
-                    f"\t{c['INS']}\t{c['DEL']}\t{c['DUP']}\t{c['INV']}\t{c['TRA']}\t{total}"
-                    f"\t{join_list(a['pos']['INS'])}"
-                    f"\t{join_list(a['pos']['DEL'])}"
-                    f"\t{join_list(a['pos']['DUP'])}"
-                    f"\t{join_list(a['pos']['INV'])}"
-                    f"\t{join_list(a['pos']['TRA'])}\n"
-                )
-        # Count SVs per assembly from the in-memory truth list
-        counts = {}
-        for ev in truth:
-            d = counts.setdefault(ev.asm, {"INS":0,"DEL":0,"DUP":0,"INV":0,"TRA":0})
-            if ev.kind in d:
-                d[ev.kind] += 1
+    if truth_all_fh is not None:
+        truth_all_fh.close()
+    if manifest_fh is not None:
+        manifest_fh.close()
 
-        with open(mpath, "w") as mf:
-            mf.write("asm\tfasta_path\tref_path\ttruth_path\tn_INS\tn_DEL\tn_DUP\tn_INV\tn_TRA\tn_SV_total\n")
-            for i in range(args.n_genomes):
-                asm_name = f"{args.prefix}{i:0{args.digits}d}"
-                fasta_abs = os.path.join(outdir_abs, asm_name + ".fa")
-                d = counts.get(asm_name, {"INS":0,"DEL":0,"DUP":0,"INV":0,"TRA":0})
-                total = d["INS"] + d["DEL"] + d["DUP"] + d["INV"] + d["TRA"]
-                mf.write(
-                    f"{asm_name}\t{fasta_abs}\t{ref_abs}\t{truth_abs}"
-                    f"\t{d['INS']}\t{d['DEL']}\t{d['DUP']}\t{d['INV']}\t{d['TRA']}\t{total}\n"
-                )
+    # Final message
+    first = f"{args.prefix}{args.start_idx:0{args.digits}d}"
+    last = f"{args.prefix}{(args.start_idx + args.n_genomes - 1):0{args.digits}d}"
     print("AMF-style simulation complete:")
-    print("  ref.fa (multi-contig)")
-    first = f"{args.prefix}{0:0{args.digits}d}"
-    last = f"{args.prefix}{(args.n_genomes-1):0{args.digits}d}"
+    print(f"  {args.ref_out} (multi-contig)")
     print(f"  {os.path.join(args.outdir, first + '.fa')} ... {os.path.join(args.outdir, last + '.fa')}  (n={args.n_genomes})")
-    print(f"  {os.path.join(args.outdir, 'truth_all.tsv')}")
+    if args.truth_all_mode != "none":
+        print(f"  {os.path.join(args.outdir, 'truth_all.tsv')}")
+    if args.per_asm_truth:
+        print(f"  {os.path.join(args.outdir, first + '.truth.tsv')} ...")
     if args.manifest:
-        # Manifest includes per-assembly SV counts + compact positions + per-assembly truth path.
-        # Per-assembly truth is written to: <outdir>/<asm>.truth.tsv
-        # Positions are encoded as:
-        #   INS/DEL:  contig:pos(len)
-        #   DUP/INV:  contig:start-end
-        #   TRA:      contig:start-end->target_contig:target
-        mpath = os.path.join(args.outdir, "manifest.tsv")
-        outdir_abs = os.path.abspath(args.outdir)
-        ref_abs = os.path.abspath("ref.fa")
-        truth_all_abs = os.path.abspath(os.path.join(args.outdir, "truth_all.tsv"))
+        print(f"  {os.path.join(args.outdir, 'manifest.tsv')}")
 
-        # Aggregate per-assembly from the combined truth list
-        agg = {}
-        for ev in truth:
-            a = agg.setdefault(ev.asm, {
-                "count": {"INS":0,"DEL":0,"DUP":0,"INV":0,"TRA":0},
-                "pos":   {"INS":[], "DEL":[], "DUP":[], "INV":[], "TRA":[]}
-            })
-            if ev.kind in a["count"]:
-                a["count"][ev.kind] += 1
-            if ev.kind == "INS":
-                a["pos"]["INS"].append(f"{ev.contig}:{ev.pos}({ev.length})")
-            elif ev.kind == "DEL":
-                a["pos"]["DEL"].append(f"{ev.contig}:{ev.pos}({ev.length})")
-            elif ev.kind == "DUP":
-                a["pos"]["DUP"].append(f"{ev.contig}:{ev.start}-{ev.end}")
-            elif ev.kind == "INV":
-                a["pos"]["INV"].append(f"{ev.contig}:{ev.start}-{ev.end}")
-            elif ev.kind == "TRA":
-                a["pos"]["TRA"].append(f"{ev.contig}:{ev.start}-{ev.end}->{ev.target_contig}:{ev.target}")
-
-        def sort_key(tok: str):
-            contig, rest = tok.split(":", 1)
-            num = 0
-            m = re.search(r"(\d+)", rest)
-            if m: num = int(m.group(1))
-            return (contig, num, rest)
-
-        def join_list(xs):
-            xs2 = sorted(xs, key=sort_key)
-            return ";".join(xs2)
-
-        with open(mpath, "w") as mf:
-            mf.write(
-                "asm\tfasta_path\tref_path\ttruth_path\ttruth_all_path"
-                "\tn_INS\tn_DEL\tn_DUP\tn_INV\tn_TRA\tn_SV_total"
-                "\tINS_pos\tDEL_pos\tDUP_pos\tINV_pos\tTRA_pos\n"
-            )
-
-            for i in range(args.n_genomes):
-                asm_name = f"{args.prefix}{i:0{args.digits}d}"
-                fasta_abs = os.path.join(outdir_abs, asm_name + ".fa")
-                truth_abs = os.path.join(outdir_abs, asm_name + ".truth.tsv")
-
-                a = agg.get(asm_name, {"count":{"INS":0,"DEL":0,"DUP":0,"INV":0,"TRA":0},
-                                       "pos":{"INS":[],"DEL":[],"DUP":[],"INV":[],"TRA":[]}})
-                c = a["count"]
-                total = c["INS"] + c["DEL"] + c["DUP"] + c["INV"] + c["TRA"]
-
-                mf.write(
-                    f"{asm_name}\t{fasta_abs}\t{ref_abs}\t{truth_abs}\t{truth_all_abs}"
-                    f"\t{c['INS']}\t{c['DEL']}\t{c['DUP']}\t{c['INV']}\t{c['TRA']}\t{total}"
-                    f"\t{join_list(a['pos']['INS'])}"
-                    f"\t{join_list(a['pos']['DEL'])}"
-                    f"\t{join_list(a['pos']['DUP'])}"
-                    f"\t{join_list(a['pos']['INV'])}"
-                    f"\t{join_list(a['pos']['TRA'])}\n"
-                )
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
