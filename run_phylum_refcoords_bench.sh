@@ -25,6 +25,15 @@ set -euo pipefail
 #	  /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/test_amf.py \
 #	  /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/main_oracle.cpp \
 #	  results_phyla_oracle
+
+# export N_GENOMES=500
+# export MAX_MULTISAMPLE=50     # above this -> per-sample VCF mode
+# export N_JOBS=8                # parallelism for truth->VCF conversion
+
+#	  bash /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/run_phylum_refcoords_bench.sh \
+#	  /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/test_amf.py \
+#	  /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/main.cpp \
+#	  results_big
 #
 # Inputs:
 #   $1 = test_amf.py
@@ -414,7 +423,7 @@ chmod +x "$TRUTH_LIFT"
 EVAL="$ROOT_OUT/eval_vcfs.py"
 cat > "$EVAL" <<'PY'
 #!/usr/bin/env python3
-import sys
+import sys, os, glob
 from collections import defaultdict
 
 def parse_info(info):
@@ -425,16 +434,19 @@ def parse_info(info):
             d[k]=v
     return d
 
-def read_vcf(path):
+def _read_one_vcf(path, sample_hint=None):
     samples=[]
     recs=[]
     with open(path) as f:
         for line in f:
-            if line.startswith("##"): continue
-            if line.startswith("#CHROM"):
-                samples=line.rstrip("\n").split("\t")[9:]
+            if line.startswith("##"):
                 continue
-            if not line.strip() or line.startswith("#"): continue
+            if line.startswith("#CHROM"):
+                parts=line.rstrip("\n").split("\t")
+                samples=parts[9:]
+                continue
+            if not line.strip() or line.startswith("#"):
+                continue
             P=line.rstrip("\n").split("\t")
             chrom=P[0]; pos=int(P[1])
             info=parse_info(P[7])
@@ -442,99 +454,97 @@ def read_vcf(path):
             end=int(info.get("END",str(pos)))
             chr2=info.get("CHR2","")
             pos2=int(info.get("POS2","0")) if "POS2" in info else 0
+
             present=set()
-            for s,gt in zip(samples, P[9:]):
-                gt=gt.strip()
-                if gt not in ("0","0/0","./."):
-                    present.add(s)
+            if len(P) >= 10 and samples:
+                for s,gt in zip(samples, P[9:]):
+                    gt=gt.strip()
+                    if gt not in ("0","0/0","./."):
+                        present.add(s)
+            else:
+                # Sites-only or single-sample VCF without samples in header
+                if sample_hint:
+                    present.add(sample_hint)
+
             recs.append((chrom,pos,end,svt,chr2,pos2,present))
     return recs
+
+def read_vcf(path):
+    # path can be a file or a directory containing many *.vcf
+    if os.path.isdir(path):
+        recs=[]
+        files=sorted(glob.glob(os.path.join(path, "*.vcf")))
+        for fp in files:
+            stem=os.path.basename(fp)
+            sample=os.path.splitext(stem)[0]
+            recs.extend(_read_one_vcf(fp, sample_hint=sample))
+        return recs
+    else:
+        return _read_one_vcf(path)
 
 def bucket_key(r, binw):
     chrom,pos,end,svt,chr2,pos2,_=r
     if svt=="TRA":
-        # Canonicalize TRA so that (CHROM,POS,CHR2,POS2) and swapped representations
-        # hash to the same bucket.
         if (chrom, chr2) <= (chr2, chrom):
             c1,p1,c2,p2 = chrom,pos,chr2,pos2
         else:
             c1,p1,c2,p2 = chr2,pos2,chrom,pos
-        return (c1,svt,c2,p1//binw,p2//binw)
-    return (chrom,svt,chr2,0,pos//binw)
+        return ("TRA", c1, c2, p1//binw, p2//binw)
+    return (svt, chrom, pos//binw)
 
-def is_match(t,c,tol):
-    ctg_t,p_t,e_t,svt_t,chr2_t,pos2_t,_=t
-    ctg_c,p_c,e_c,svt_c,chr2_c,pos2_c,_=c
-    if svt_t!=svt_c:
-        return False
-    if svt_t=="TRA":
-        # Compare canonicalized endpoints (unordered TRA).
-        if (ctg_t, chr2_t) <= (chr2_t, ctg_t):
-            t1, tp1, t2, tp2 = ctg_t, p_t, chr2_t, pos2_t
-        else:
-            t1, tp1, t2, tp2 = chr2_t, pos2_t, ctg_t, p_t
-        if (ctg_c, chr2_c) <= (chr2_c, ctg_c):
-            c1, cp1, c2, cp2 = ctg_c, p_c, chr2_c, pos2_c
-        else:
-            c1, cp1, c2, cp2 = chr2_c, pos2_c, ctg_c, p_c
-        if t1!=c1 or t2!=c2:
-            return False
-        return abs(tp1-cp1)<=tol and abs(tp2-cp2)<=tol
-    if ctg_t!=ctg_c:
-        return False
-    if ctg_t!=ctg_c:
-        return False
-    return abs(p_t-p_c)<=tol and abs(e_t-e_c)<=tol
-
-def main():
-    if len(sys.argv) < 3:
-        print("usage: eval_vcfs.py truth.vcf out.vcf [tol=1000]", file=sys.stderr)
-        sys.exit(1)
-    truth_vcf=sys.argv[1]
-    out_vcf=sys.argv[2]
-    tol=int(sys.argv[3]) if len(sys.argv)>3 else 1000
-    binw=max(200,tol)
-
-    truth=read_vcf(truth_vcf)
-    calls=read_vcf(out_vcf)
-
-    idx=defaultdict(list)
-    for t in truth:
-        idx[bucket_key(t,binw)].append(t)
+def match(truth, calls, tol):
+    # Build buckets for calls
+    binw = max(1, tol)
+    buckets = defaultdict(list)
+    for r in calls:
+        buckets[bucket_key(r, binw)].append(r)
 
     used=set()
-    TP=FP=FN=0
-
-    for c in calls:
-        for s in c[6]:
-            found=False
-            chrom,svt,chr2,pos2b,b = bucket_key(c,binw)
-            for db in (-1,0,1):
-                cand = idx.get((chrom,svt,chr2,pos2b,b+db), [])
-                for t in cand:
-                    if s not in t[6]:
-                        continue
-                    tid=(id(t),s)
-                    if tid in used:
-                        continue
-                    if is_match(t,c,tol):
-                        used.add(tid)
-                        TP += 1
-                        found=True
-                        break
-                if found:
-                    break
-            if not found:
-                FP += 1
-
+    TP=0
     for t in truth:
-        for s in t[6]:
-            if (id(t),s) not in used:
-                FN += 1
+        key=bucket_key(t, binw)
+        found=False
+        for c in buckets.get(key, []):
+            if id(c) in used:
+                continue
+            chrom_t,pos_t,end_t,svt_t,chr2_t,pos2_t,samp_t=t
+            chrom_c,pos_c,end_c,svt_c,chr2_c,pos2_c,samp_c=c
+            if svt_t != svt_c:
+                continue
+            # Sample overlap: treat as match if there is any shared sample (multisample) or if either side is sites-only.
+            if samp_t and samp_c and samp_t.isdisjoint(samp_c):
+                continue
+            if svt_t == "TRA":
+                # allow swapped
+                ok = (
+                    chrom_t==chrom_c and chr2_t==chr2_c and abs(pos_t-pos_c)<=tol and abs(pos2_t-pos2_c)<=tol
+                ) or (
+                    chrom_t==chr2_c and chr2_t==chrom_c and abs(pos_t-pos2_c)<=tol and abs(pos2_t-pos_c)<=tol
+                )
+                if ok:
+                    found=True
+            else:
+                if chrom_t==chrom_c and abs(pos_t-pos_c)<=tol and abs(end_t-end_c)<=tol:
+                    found=True
+            if found:
+                used.add(id(c))
+                TP += 1
+                break
 
-    prec = TP/(TP+FP) if (TP+FP) else 0.0
-    rec  = TP/(TP+FN) if (TP+FN) else 0.0
+    FP = len(calls) - len(used)
+    FN = len(truth) - TP
+    return TP,FP,FN
 
+def main():
+    if len(sys.argv) < 4:
+        print("Usage: eval_vcfs.py TRUTH(.vcf|dir) CALLS(.vcf|dir) TOL_BP", file=sys.stderr)
+        sys.exit(2)
+    truth_path, calls_path, tol = sys.argv[1], sys.argv[2], int(sys.argv[3])
+    truth = read_vcf(truth_path)
+    calls = read_vcf(calls_path)
+    TP,FP,FN = match(truth, calls, tol)
+    prec = TP / (TP+FP) if (TP+FP)>0 else 0.0
+    rec  = TP / (TP+FN) if (TP+FN)>0 else 0.0
     print(f"TP\t{TP}")
     print(f"FP\t{FP}")
     print(f"FN\t{FN}")
@@ -566,6 +576,8 @@ PHYLUM_FILTER="${PHYLUM_FILTER:-}"
 TOL_BP="${TOL_BP:-5000}"
 OVR_NGEN="${N_GENOMES:-}"
 OVR_TLEN="${TOTAL_LEN:-}"
+MAX_MULTISAMPLE="${MAX_MULTISAMPLE:-200}"
+N_JOBS="${N_JOBS:-4}"
 
 # SV profile per genome
 INS=2
@@ -585,8 +597,8 @@ SEG_LEN_MIN=2000   # used for DUP/INV/TRA segments
 SEG_LEN_MAX=5000
 
 # Caller parameters
-MIN_SEEDS=5
-TOP_CONTIGS=1000
+MIN_SEEDS="${MIN_SEEDS:-200}"   # strong support for 500Mb genomes
+TOP_CONTIGS="${TOP_CONTIGS:-20}" # typical large-genome assemblies: ~20 contigs
 SV_MIN=500          # minimum SV size for INV/DUP (and general heuristics)
 SV_MIN_INDEL=500    # minimum INS/DEL size extracted from alignment
 
@@ -658,38 +670,72 @@ for row in "${PHYLUMS[@]}"; do
     exit 1
   fi
 
-  echo "[info] Converting truth_all.tsv -> truth.refcoords.vcf"
-  python3 "$TRUTH_LIFT" "ref.fa" "$ASM/truth_all.tsv" "$OUT/truth.refcoords.vcf"
+  if [[ "$NGEN" -le "$MAX_MULTISAMPLE" ]]; then
+    echo "[info] Converting truth_all.tsv -> truth.refcoords.vcf"
+    python3 "$TRUTH_LIFT" "ref.fa" "$ASM/truth_all.tsv" "$OUT/truth.refcoords.vcf"
 
-  echo "[info] Running caller -> out.vcf"
-  # NOTE: Keep this invocation as a single continued block.
-  # A stray blank line after a trailing '\\' breaks argument parsing and can cause
-  # subsequent phylum runs to fail or mix outputs.
-  "$BIN" \
-    --ref "$OUT/ref.fa" \
-    --asm-dir "$ASM" \
-    --out "$OUT/out.gfa" \
-    --vcf "$OUT/out.vcf" \
-    --sv "$SV_MIN" \
-    --sv-indel "$SV_MIN_INDEL" \
-    --min-seeds "$MIN_SEEDS" \
-    --top-contigs "$TOP_CONTIGS" \
-    --min-contig 1 \
-    --candidates "$CANDIDATES" \
-    --mapq-ratio "$MAPQ_RATIO" \
-    --split-map "$SPLIT_MAP" \
-    --vcf-checkpoint "$VCF_CHECKPOINT" \
-    $( [[ "$ORACLE_TRUTH" == "1" ]] && echo "--oracle-truth" "$ASM/truth_all.tsv" ) \
-    > "$OUT/stdout.log" 2> "$OUT/stderr.log" || true
+    echo "[info] Running caller -> out.vcf"
+    "$BIN" \
+      --ref "$OUT/ref.fa" \
+      --asm-dir "$ASM" \
+      --out "$OUT/out.gfa" \
+      --vcf "$OUT/out.vcf" \
+      --sv "$SV_MIN" \
+      --sv-indel "$SV_MIN_INDEL" \
+      --min-seeds "$MIN_SEEDS" \
+      --top-contigs "$TOP_CONTIGS" \
+      --min-contig 1 \
+      --candidates "$CANDIDATES" \
+      --mapq-ratio "$MAPQ_RATIO" \
+      --split-map "$SPLIT_MAP" \
+      --vcf-checkpoint "$VCF_CHECKPOINT" \
+      $( [[ "$ORACLE_TRUTH" == "1" ]] && echo "--oracle-truth" "$ASM/truth_all.tsv" ) \
+      > "$OUT/stdout.log" 2> "$OUT/stderr.log" || true
 
-  if [[ ! -f "$OUT/out.vcf" ]]; then
-    echo "[warn] out.vcf missing for $PHYLUM (see stderr.log)" >&2
-    popd >/dev/null
-    continue
+    if [[ ! -f "$OUT/out.vcf" ]]; then
+      echo "[warn] out.vcf missing for $PHYLUM (see stderr.log)" >&2
+      popd >/dev/null
+      continue
+    fi
+
+    echo "[info] Evaluating out.vcf vs truth.refcoords.vcf (tol=${TOL_BP})"
+    python3 "$EVAL" "$OUT/truth.refcoords.vcf" "$OUT/out.vcf" "$TOL_BP" | tee "$OUT/metrics.txt"
+  else
+    echo "[info] Large NGEN=${NGEN} (> MAX_MULTISAMPLE=${MAX_MULTISAMPLE}): using per-sample VCFs (per-sample VCF output)"
+    TRUTH_VCFS="$OUT/truth_vcfs"
+    CALL_VCFS="$OUT/call_vcfs"
+    mkdir -p "$TRUTH_VCFS" "$CALL_VCFS"
+
+    echo "[info] Converting per-assembly truth -> per-sample truth VCFs (parallel jobs=${N_JOBS})"
+    ls "$ASM"/${INS+asm_}*.truth.tsv >/dev/null 2>&1 || true
+    find "$ASM" -maxdepth 1 -name "*.truth.tsv" -print0 \
+      | xargs -0 -n 1 -P "$N_JOBS" bash -lc '
+          tsv="$0"
+          asm="$(basename "$tsv" .truth.tsv)"
+          python3 "'"$TRUTH_LIFT"'" "ref.fa" "$tsv" "'"$TRUTH_VCFS"'/${asm}.vcf"
+        '
+
+    echo "[info] Running caller (per-sample VCFs) -> $CALL_VCFS"
+    "$BIN" \
+      --ref "$OUT/ref.fa" \
+      --asm-dir "$ASM" \
+      --out "$OUT/out.gfa" \
+      --vcf-dir "$CALL_VCFS" \
+      --sv "$SV_MIN" \
+      --sv-indel "$SV_MIN_INDEL" \
+      --min-seeds "$MIN_SEEDS" \
+      --top-contigs "$TOP_CONTIGS" \
+      --min-contig 1 \
+      --candidates "$CANDIDATES" \
+      --mapq-ratio "$MAPQ_RATIO" \
+      --split-map "$SPLIT_MAP" \
+      --vcf-checkpoint "$VCF_CHECKPOINT" \
+      $( [[ "$ORACLE_TRUTH" == "1" ]] && echo "--oracle-truth" "$ASM/truth_all.tsv" ) \
+      > "$OUT/stdout.log" 2> "$OUT/stderr.log" || true
+
+    echo "[info] Evaluating per-sample calls vs per-sample truth (tol=${TOL_BP})"
+    python3 "$EVAL" "$TRUTH_VCFS" "$CALL_VCFS" "$TOL_BP" | tee "$OUT/metrics.txt"
   fi
-
-  echo "[info] Evaluating out.vcf vs truth.refcoords.vcf (tol=${TOL_BP})"
-  python3 "$EVAL" "$OUT/truth.refcoords.vcf" "$OUT/out.vcf" "$TOL_BP" | tee "$OUT/metrics.txt"
 
   TP=$(awk '$1=="TP"{print $2}' "$OUT/metrics.txt")
   FP=$(awk '$1=="FP"{print $2}' "$OUT/metrics.txt")
@@ -703,4 +749,3 @@ for row in "${PHYLUMS[@]}"; do
 done
 
 echo "[done] Summary written to: $ROOT_OUT/metrics.tsv"
-
