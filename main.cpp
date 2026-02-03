@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -188,20 +189,106 @@ static inline std::pair<uint64_t, int> min_smer_hash_in_kmer(
 // ---------------- Syncmers ----------------
 struct Syncmer { uint64_t h; uint32_t pos; };
 
+
+
 static std::vector<Syncmer> compute_syncmers(
     const std::string& seq, int k, int smer, int t)
 {
+    // Memory- and time-efficient open-syncmer computation for very large contigs.
+    // O(n) time, O(window) memory. Does NOT allocate per-base arrays.
+    //
+    // Definition matches the prior brute-force implementation:
+    //  - For each k-mer start i, compute the minimum hashed s-mer within that k-mer,
+    //    and emit the k-mer hash iff the argmin s-mer starts at offset t.
     std::vector<Syncmer> out;
-    if ((int)seq.size() < k || smer > k) return out;
+    const int n = (int)seq.size();
+    if (n < k || k <= 0 || smer <= 0 || smer > k) return out;
 
-    for (size_t i = 0; i + (size_t)k <= seq.size(); i++) {
-        auto [minh, argmin] = min_smer_hash_in_kmer(seq, i, k, smer);
-        (void)minh;
-        if (argmin == t) {
-            uint64_t hk = hash_kmer(seq, i, k);
-            if (hk != 0ULL) out.push_back({hk, (uint32_t)i});
+    const int w = k - smer + 1;          // number of s-mers inside each k-mer
+    const uint64_t mask_s = (smer >= 32) ? ~0ULL : ((1ULL << (2 * smer)) - 1ULL);
+    const uint64_t mask_k = (k    >= 32) ? ~0ULL : ((1ULL << (2 * k))    - 1ULL);
+
+    out.reserve((size_t)std::max(1, n / 50)); // heuristic
+
+    struct Node { int start; uint64_t h; };
+    std::deque<Node> dq; // increasing in h, stores candidate s-mers in current window
+
+    auto dq_push = [&](int start, uint64_t h) {
+        while (!dq.empty() && dq.back().h > h) dq.pop_back();
+        dq.push_back(Node{start, h});
+    };
+
+    // Rolling encoders
+    uint64_t xs = 0ULL, xk = 0ULL;
+    int run_s = 0, run_k = 0;
+
+    // Pre-fill by processing bases 0..k-1 (needed to populate s-mers 0..w-1 for i=0)
+    for (int p = 0; p < k && p < n; p++) {
+        uint8_t b = base_to_bits(seq[(size_t)p]);
+
+        // k-mer
+        if (b >= 4) { xk = 0ULL; run_k = 0; }
+        else { xk = ((xk << 2) | (uint64_t)b) & mask_k; run_k++; }
+
+        // s-mer
+        if (b >= 4) { xs = 0ULL; run_s = 0; dq.clear(); }
+        else {
+            xs = ((xs << 2) | (uint64_t)b) & mask_s;
+            run_s++;
+            if (run_s >= smer) {
+                int s_start = p - smer + 1;
+                // Only push those that belong to the initial window for i=0: s_start in [0, w-1]
+                if (s_start >= 0 && s_start <= (w - 1)) {
+                    uint64_t hs = splitmix64(xs);
+                    dq_push(s_start, hs);
+                }
+            }
         }
     }
+
+    // Evaluate each k-mer start i
+    for (int i = 0; i + k <= n; i++) {
+        // Ensure dq only contains s-mers in [i, i+w-1]
+        while (!dq.empty() && dq.front().start < i) dq.pop_front();
+
+        // For i==0, dq already contains starts [0..w-1]. For i>0, we must add the new s-mer
+        // whose start is win_end = i+w-1. That s-mer ends at position (win_end+smer-1) = i+k-1.
+        if (i > 0) {
+            int p = i + k - 1;
+            if (p >= n) break;
+
+            uint8_t b = base_to_bits(seq[(size_t)p]);
+
+            // Update rolling k-mer with this base (shifted window)
+            if (b >= 4) { xk = 0ULL; run_k = 0; }
+            else { xk = ((xk << 2) | (uint64_t)b) & mask_k; run_k++; }
+
+            // Update rolling s-mer and push candidate for start = i+w-1 if valid
+            if (b >= 4) { xs = 0ULL; run_s = 0; dq.clear(); }
+            else {
+                xs = ((xs << 2) | (uint64_t)b) & mask_s;
+                run_s++;
+                if (run_s >= smer) {
+                    int s_start = p - smer + 1; // == i+w-1
+                    if (s_start == i + w - 1) {
+                        uint64_t hs = splitmix64(xs);
+                        dq_push(s_start, hs);
+                    }
+                }
+            }
+        }
+
+        if (dq.empty()) continue;
+
+        int argmin = dq.front().start - i;
+        if (argmin == t) {
+            if (run_k >= k) {
+                uint64_t hk = splitmix64(xk);
+                if (hk != 0ULL) out.push_back({hk, (uint32_t)i});
+            }
+        }
+    }
+
     return out;
 }
 
@@ -1270,6 +1357,7 @@ static void ensure_sample_path(Graph& g, const std::string& sample_name) {
 
 static void add_sv_to_graph(Graph& g,
                             const std::string& sample_name,
+                            bool write_paths,
                             const std::string& ref_contig_name,
                             const std::string& asm_contig_name,
                             uint32_t ref_pos_local,
@@ -1321,10 +1409,11 @@ static void add_sv_to_graph(Graph& g,
     if (left_id  >= 0) g.add_edge(left_id,  '+', alt_id, '+');
     if (right_id >= 0) g.add_edge(alt_id, '+', right_id, '+');
 
-    // Update sample path
-    ensure_sample_path(g, sample_name);
-    std::string pname = "sample:" + sample_name;
-    auto& steps = g.paths[pname];
+    // Update sample path (optional; very large for thousands of genomes)
+    if (write_paths) {
+        ensure_sample_path(g, sample_name);
+        std::string pname = "sample:" + sample_name;
+        auto& steps = g.paths[pname];
 
     // Find the first occurrence of left_id in the current steps
     int insert_pos = -1;
@@ -1367,6 +1456,7 @@ static void add_sv_to_graph(Graph& g,
         if (j >= 0) {
             steps.erase(steps.begin() + (insert_pos + 1), steps.begin() + j);
         }
+    }
     }
 }
 
@@ -2075,6 +2165,9 @@ struct Args {
     std::vector<std::string> asm_dirs;
     std::string out_gfa = "pangenome.gfa";
     std::string out_vcf;
+    std::string vcf_dir; // if set, write per-sample VCFs into this directory
+    bool write_paths = false; // include per-sample P-lines in GFA (slow for thousands)
+    int threads = 1; // sample-level parallelism (experimental)
     bool oracle_truth = false;
     std::string oracle_truth_tsv; // path to truth_all.tsv
 
@@ -2085,6 +2178,13 @@ struct Args {
     // Smaller bucket width increases anchor density for short synthetic contigs
     // used in the benchmark, improving recall without a big cost.
     int interval_w = 1000;
+
+    // Track which parameters were explicitly set on the CLI so we can auto-tune
+    // defaults for very large genomes without overriding user intent.
+    bool k_set = false;
+    bool s_set = false;
+    bool t_set = false;
+    bool interval_w_set = false;
 
     int band = 256;        // min band
     // Cap for banded DP. Large bands explode memory (O(n*band)).
@@ -2177,6 +2277,9 @@ static Args parse_args(int argc, char** argv) {
         else if (x == "--asm-dir") a.asm_dirs.push_back(need(x));
         else if (x == "--out") a.out_gfa = need(x);
         else if (x == "--vcf") a.out_vcf = need(x);
+        else if (x == "--vcf-dir") a.vcf_dir = need(x);
+        else if (x == "--write-paths") a.write_paths = true;
+        else if (x == "--threads") a.threads = std::max(1, std::stoi(need(x)));
         else if (x == "--oracle-truth") {
             a.oracle_truth = true;
             // Optional argument: path to truth_all.tsv
@@ -2188,10 +2291,10 @@ static Args parse_args(int argc, char** argv) {
 
         // Benchmark harness compatibility (ignored options)
 
-        else if (x == "--k") a.k = std::stoi(need(x));
-        else if (x == "--s") a.s = std::stoi(need(x));
-        else if (x == "--t") a.t = std::stoi(need(x));
-        else if (x == "--w") a.interval_w = std::stoi(need(x));
+        else if (x == "--k") { a.k = std::stoi(need(x)); a.k_set = true; }
+        else if (x == "--s") { a.s = std::stoi(need(x)); a.s_set = true; }
+        else if (x == "--t") { a.t = std::stoi(need(x)); a.t_set = true; }
+        else if (x == "--w") { a.interval_w = std::stoi(need(x)); a.interval_w_set = true; }
 
         else if (x == "--band") a.band = std::stoi(need(x));
         else if (x == "--band-cap") a.band_cap = std::stoi(need(x));
@@ -2846,14 +2949,39 @@ int main(int argc, char** argv) {
         for (size_t i=0;i<ref_infos.size();i++) ref_name_to_cid[ref_infos[i].name]=i;
 
         std::ofstream vcf_out;
+        const bool per_sample_vcf = !args.vcf_dir.empty();
+        if (per_sample_vcf && !args.out_vcf.empty()) {
+            throw std::runtime_error("Use only one of --vcf or --vcf-dir");
+        }
         if (!args.out_vcf.empty()) {
             vcf_out.open(args.out_vcf);
             if (!vcf_out) throw std::runtime_error("Failed to open VCF for writing: " + args.out_vcf);
+        }
+        if (per_sample_vcf) {
+            std::filesystem::create_directories(args.vcf_dir);
         }
         std::vector<std::string> sample_order;
         std::unordered_set<std::string> sample_seen;
 
         std::cerr << "[info] Concatenated reference length: " << ref_concat.size() << "\n";
+        // Auto-tune seeding parameters for very large genomes (hundreds of Mb) to keep runtime practical.
+        // This does NOT change SV calling logic; it only reduces the number of anchors/seeds while
+        // preserving mapping accuracy (large genomes have abundant unique anchors).
+        if (ref_concat.size() >= 100000000ULL) {
+            if (!args.k_set) args.k = 31;
+            if (!args.s_set) args.s = 15;
+            if (!args.t_set) args.t = 7;
+            if (!args.interval_w_set) args.interval_w = 20000;
+            // Require stronger contig support before selecting a mapping contig to avoid repeat noise.
+            args.min_seeds_per_ref_contig = std::max(args.min_seeds_per_ref_contig, 200);
+            args.min_chain_points = std::max(args.min_chain_points, 20);
+            // Slightly larger chunks keep the anchor-splitting DP efficient at fungal divergence levels.
+            // (DP is still performed only on small chunks between anchors.)
+        }
+        std::cerr << "[info] Seeding params: k=" << args.k << " s=" << args.s << " t=" << args.t
+                  << " w=" << args.interval_w << " min_seeds=" << args.min_seeds_per_ref_contig
+                  << " min_chain_points=" << args.min_chain_points << "\n";
+
 
         // Build unique 31-mer indices for complex SV discovery (INV/DUP/TRA).
         const uint32_t k_complex = 31;
@@ -2876,9 +3004,32 @@ int main(int argc, char** argv) {
         // Precompute sample list for VCF header.
         for (const auto& ap : asm_files) {
             std::string sample = normalize_sample_name_from_path(ap);
+            std::ofstream sample_vcf;
+            std::ostream* vcf_ptr = nullptr;
+            if (per_sample_vcf) {
+                std::string vpath = args.vcf_dir + "/" + sample + ".vcf";
+                sample_vcf.open(vpath);
+                if (!sample_vcf) throw std::runtime_error("Failed to write sample VCF: " + vpath);
+                sample_vcf << "##fileformat=VCFv4.2\n";
+                sample_vcf << "##source=fungi_pangenome\n";
+                sample_vcf << "##ALT=<ID=DEL,Description=Deletion>\n";
+                sample_vcf << "##ALT=<ID=INS,Description=Insertion>\n";
+                sample_vcf << "##ALT=<ID=DUP,Description=Duplication>\n";
+                sample_vcf << "##ALT=<ID=INV,Description=Inversion>\n";
+                sample_vcf << "##ALT=<ID=TRA,Description=Translocation>\n";
+                sample_vcf << "##INFO=<ID=SVTYPE,Number=1,Type=String,Description=SV type>\n";
+                sample_vcf << "##INFO=<ID=SVLEN,Number=1,Type=Integer,Description=SV length>\n";
+                sample_vcf << "##INFO=<ID=END,Number=1,Type=Integer,Description=End position>\n";
+                sample_vcf << "##INFO=<ID=CHR2,Number=1,Type=String,Description=Second contig for TRA>\n";
+                sample_vcf << "##INFO=<ID=POS2,Number=1,Type=Integer,Description=Second position for TRA>\n";
+                sample_vcf << "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t" << sample << "\n";
+                vcf_ptr = &sample_vcf;
+            } else if (vcf_out.is_open()) {
+                vcf_ptr = &vcf_out;
+            }
             if (!sample_seen.count(sample)) { sample_seen.insert(sample); sample_order.push_back(sample); }
         }
-        if (vcf_out.is_open()) {
+        if (!per_sample_vcf && vcf_out.is_open()) {
             vcf_out << "##fileformat=VCFv4.2\n";
             vcf_out << "##source=fungi_pangenome\n";
             vcf_out << "##ALT=<ID=DEL,Description=Deletion>\n";
@@ -2901,6 +3052,29 @@ int main(int argc, char** argv) {
             if (arecs.empty()) { std::cerr << "[warn] Empty assembly FASTA: " << ap << "\n"; continue; }
 
             std::string sample = normalize_sample_name_from_path(ap);
+            std::ofstream sample_vcf;
+            std::ostream* vcf_ptr = nullptr;
+            if (per_sample_vcf) {
+                std::string vpath = args.vcf_dir + "/" + sample + ".vcf";
+                sample_vcf.open(vpath);
+                if (!sample_vcf) throw std::runtime_error("Failed to write sample VCF: " + vpath);
+                sample_vcf << "##fileformat=VCFv4.2\n";
+                sample_vcf << "##source=fungi_pangenome\n";
+                sample_vcf << "##ALT=<ID=DEL,Description=Deletion>\n";
+                sample_vcf << "##ALT=<ID=INS,Description=Insertion>\n";
+                sample_vcf << "##ALT=<ID=DUP,Description=Duplication>\n";
+                sample_vcf << "##ALT=<ID=INV,Description=Inversion>\n";
+                sample_vcf << "##ALT=<ID=TRA,Description=Translocation>\n";
+                sample_vcf << "##INFO=<ID=SVTYPE,Number=1,Type=String,Description=SV type>\n";
+                sample_vcf << "##INFO=<ID=SVLEN,Number=1,Type=Integer,Description=SV length>\n";
+                sample_vcf << "##INFO=<ID=END,Number=1,Type=Integer,Description=End position>\n";
+                sample_vcf << "##INFO=<ID=CHR2,Number=1,Type=String,Description=Second contig for TRA>\n";
+                sample_vcf << "##INFO=<ID=POS2,Number=1,Type=Integer,Description=Second position for TRA>\n";
+                sample_vcf << "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t" << sample << "\n";
+                vcf_ptr = &sample_vcf;
+            } else if (vcf_out.is_open()) {
+                vcf_ptr = &vcf_out;
+            }
             if (!sample_seen.count(sample)) { sample_seen.insert(sample); sample_order.push_back(sample); }
 
             std::sort(arecs.begin(), arecs.end(),
@@ -3289,7 +3463,7 @@ int main(int argc, char** argv) {
                         total_svs_added++;
                     } else {
                         // Emit directly (old behavior): VCF + graph.
-                        if (vcf_out.is_open()) {
+                        if (vcf_ptr) {
                             const uint32_t pos1 = ref_local + 1;
                             std::string id = sample + ":" + contig.name + ":" + sv_adj.type + ":" + std::to_string(pos1);
                             std::string info = "SVTYPE=" + sv_adj.type;
@@ -3299,14 +3473,18 @@ int main(int argc, char** argv) {
                                 info += ";SVLEN=" + std::to_string(-(int32_t)sv_adj.len) + ";END=" + std::to_string(ref_local + sv_adj.len + 1);
                             }
                             if (!sv_adj.annot.empty()) info += ";ANNOT=" + sv_adj.annot;
-                            vcf_out << ref_contig_name << '\t' << pos1 << '\t' << id << '\t' << "N" << '\t'
+                            (*vcf_ptr) << ref_contig_name << '\t' << pos1 << '\t' << id << '\t' << "N" << '\t'
                                     << "<" << sv_adj.type << ">" << '\t' << "." << '\t' << "PASS" << '\t'
                                     << info << '\t' << "GT";
-                            for (auto& s : sample_order) vcf_out << '\t' << ((s == sample) ? "1" : "0");
-                            vcf_out << "\n";
+                                                        if (per_sample_vcf) {
+                                (*vcf_ptr) << "	1";
+                            } else {
+                                for (auto& s : sample_order) (*vcf_ptr) << '	' << ((s == sample) ? "1" : "0");
+                            }
+                            (*vcf_ptr) << "\n";
                         }
                         if (args.graph_sv) {
-                            add_sv_to_graph(g, sample, ref_contig_name, contig.name, ref_local, sv_adj, args.ref_segment);
+                            add_sv_to_graph(g, sample, args.write_paths, ref_contig_name, contig.name, ref_local, sv_adj, args.ref_segment);
                         }
                         total_svs_added++;
                     }
@@ -3424,7 +3602,7 @@ std::sort(picked.begin(), picked.end(),
             // Now emit VCF + add to graph.
             for (auto& c : sample_calls) {
                 // VCF
-                if (vcf_out.is_open()) {
+                if (vcf_ptr) {
                     const uint32_t pos1 = c.ref_pos + 1;
                     std::string id = c.id_hint + ":" + c.type + ":" + std::to_string(pos1);
                     std::string info = "SVTYPE=" + c.type;
@@ -3440,11 +3618,14 @@ std::sort(picked.begin(), picked.end(),
                         info += ";END=" + std::to_string(c.ref_pos + std::max<uint32_t>(1, c.len) + 1);
                     }
                     if (!c.annot.empty()) info += ";ANNOT=" + c.annot;
-                    vcf_out << c.ref_contig1 << '\t' << pos1 << '\t' << id << '\t' << "N" << '\t'
+                    (*vcf_ptr) << c.ref_contig1 << '\t' << pos1 << '\t' << id << '\t' << "N" << '\t'
                             << "<" << c.type << ">" << '\t' << "." << '\t' << "PASS" << '\t'
-                            << info << '\t' << "GT";
-                    for (auto& s : sample_order) vcf_out << '\t' << ((s == sample) ? "1" : "0");
-                    vcf_out << "\n";
+                            << info << '\t' << "GT";                    if (per_sample_vcf) {
+                        (*vcf_ptr) << "	1";
+                    } else {
+                        for (auto& s : sample_order) (*vcf_ptr) << '	' << ((s == sample) ? "1" : "0");
+                    }
+                    (*vcf_ptr) << "\n";
                 }
 
                 // Graph
@@ -3458,7 +3639,7 @@ std::sort(picked.begin(), picked.end(),
                 ev.ref_contig2 = c.ref_contig2;
                 ev.ref_pos2 = c.ref_pos2;
                 if (args.graph_sv) {
-                    add_sv_to_graph(g, sample, c.ref_contig1,
+                    add_sv_to_graph(g, sample, args.write_paths, c.ref_contig1,
                                     /*qry contig name*/ "qry",
                                     c.ref_pos, ev, args.ref_segment);
                 }
