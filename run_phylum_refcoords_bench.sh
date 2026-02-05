@@ -423,7 +423,7 @@ chmod +x "$TRUTH_LIFT"
 EVAL="$ROOT_OUT/eval_vcfs.py"
 cat > "$EVAL" <<'PY'
 #!/usr/bin/env python3
-import sys, os, glob
+import sys, os, glob, math
 from collections import defaultdict
 
 def parse_info(info):
@@ -433,6 +433,14 @@ def parse_info(info):
             k,v=p.split("=",1)
             d[k]=v
     return d
+
+def gt_is_variant(gt_field: str) -> bool:
+    # GT is first subfield before ':' (VCF spec)
+    gt = gt_field.split(":",1)[0].strip()
+    if gt in ("0","0/0","0|0",".","./.","././.","0/.","./0","0|."," . "):
+        return False
+    # Anything else (0/1, 1/1, 1|0, etc.) => present
+    return True
 
 def _read_one_vcf(path, sample_hint=None):
     samples=[]
@@ -448,7 +456,8 @@ def _read_one_vcf(path, sample_hint=None):
             if not line.strip() or line.startswith("#"):
                 continue
             P=line.rstrip("\n").split("\t")
-            chrom=P[0]; pos=int(P[1])
+            chrom=P[0]
+            pos=int(P[1])  # VCF POS is 1-based
             info=parse_info(P[7])
             svt=info.get("SVTYPE","")
             end=int(info.get("END",str(pos)))
@@ -458,8 +467,7 @@ def _read_one_vcf(path, sample_hint=None):
             present=set()
             if len(P) >= 10 and samples:
                 for s,gt in zip(samples, P[9:]):
-                    gt=gt.strip()
-                    if gt not in ("0","0/0","./."):
+                    if gt_is_variant(gt):
                         present.add(s)
             else:
                 # Sites-only or single-sample VCF without samples in header
@@ -482,53 +490,94 @@ def read_vcf(path):
     else:
         return _read_one_vcf(path)
 
-def bucket_key(r, binw):
+def bucket_keys(r, binw):
     chrom,pos,end,svt,chr2,pos2,_=r
-    if svt=="TRA":
-        if (chrom, chr2) <= (chr2, chrom):
-            c1,p1,c2,p2 = chrom,pos,chr2,pos2
-        else:
-            c1,p1,c2,p2 = chr2,pos2,chrom,pos
-        return ("TRA", c1, c2, p1//binw, p2//binw)
-    return (svt, chrom, pos//binw)
+    if svt == "TRA":
+        # allow swapped representation; bucket on both breakpoints with +/-1 neighbor bins
+        keys=set()
+        for swap in (False, True):
+            c1,p1,c2,p2 = (chrom,pos,chr2,pos2) if not swap else (chr2,pos2,chrom,pos)
+            # canonical chromosome order to reduce duplicates
+            if (c1, c2) > (c2, c1):
+                c1,p1,c2,p2 = c2,p2,c1,p1
+            b1 = p1//binw
+            b2 = p2//binw
+            for db1 in (-1,0,1):
+                for db2 in (-1,0,1):
+                    keys.add(("TRA", c1, c2, b1+db1, b2+db2))
+        return keys
+    # Non-TRA: bucket on start pos with neighbor bins
+    b = pos//binw
+    return {(svt, chrom, b-1), (svt, chrom, b), (svt, chrom, b+1)}
+
+def interval_overlap(a0,a1,b0,b1):
+    # inclusive coords in VCF; convert to half-open for overlap computation
+    lo=max(a0, b0)
+    hi=min(a1, b1)
+    return max(0, hi - lo + 1)
+
+def match_one(t, c, tol):
+    chrom_t,pos_t,end_t,svt_t,chr2_t,pos2_t,samp_t=t
+    chrom_c,pos_c,end_c,svt_c,chr2_c,pos2_c,samp_c=c
+    if svt_t != svt_c:
+        return False
+    # Sample overlap: match if any shared sample (multisample) or if either side is sites-only.
+    if samp_t and samp_c and samp_t.isdisjoint(samp_c):
+        return False
+
+    if svt_t == "TRA":
+        return (
+            (chrom_t==chrom_c and chr2_t==chr2_c and abs(pos_t-pos_c)<=tol and abs(pos2_t-pos2_c)<=tol)
+            or
+            (chrom_t==chr2_c and chr2_t==chrom_c and abs(pos_t-pos2_c)<=tol and abs(pos2_t-pos_c)<=tol)
+        )
+
+    # For INS, END is often POS or POS+1 in different emitters; match mainly on breakpoint.
+    if svt_t == "INS":
+        return (chrom_t==chrom_c and abs(pos_t-pos_c) <= tol)
+
+    # For interval SVs, allow either close breakpoints OR sufficient reciprocal overlap.
+    if chrom_t != chrom_c:
+        return False
+
+    # Normalize starts/ends
+    st_t, en_t = min(pos_t,end_t), max(pos_t,end_t)
+    st_c, en_c = min(pos_c,end_c), max(pos_c,end_c)
+
+    if abs(st_t-st_c) <= tol and abs(en_t-en_c) <= tol:
+        return True
+
+    ov = interval_overlap(st_t,en_t,st_c,en_c)
+    len_t = en_t - st_t + 1
+    len_c = en_c - st_c + 1
+    if len_t <= 0 or len_c <= 0:
+        return False
+    ro_t = ov/len_t
+    ro_c = ov/len_c
+    return (ro_t >= 0.5 and ro_c >= 0.5) and (abs(st_t-st_c) <= max(tol, 0.2*min(len_t,len_c)) or abs(en_t-en_c) <= max(tol, 0.2*min(len_t,len_c)))
 
 def match(truth, calls, tol):
-    # Build buckets for calls
     binw = max(1, tol)
     buckets = defaultdict(list)
     for r in calls:
-        buckets[bucket_key(r, binw)].append(r)
+        for k in bucket_keys(r, binw):
+            buckets[k].append(r)
 
     used=set()
     TP=0
     for t in truth:
-        key=bucket_key(t, binw)
+        cand=[]
+        for k in bucket_keys(t, binw):
+            cand.extend(buckets.get(k, []))
+
         found=False
-        for c in buckets.get(key, []):
+        for c in cand:
             if id(c) in used:
                 continue
-            chrom_t,pos_t,end_t,svt_t,chr2_t,pos2_t,samp_t=t
-            chrom_c,pos_c,end_c,svt_c,chr2_c,pos2_c,samp_c=c
-            if svt_t != svt_c:
-                continue
-            # Sample overlap: treat as match if there is any shared sample (multisample) or if either side is sites-only.
-            if samp_t and samp_c and samp_t.isdisjoint(samp_c):
-                continue
-            if svt_t == "TRA":
-                # allow swapped
-                ok = (
-                    chrom_t==chrom_c and chr2_t==chr2_c and abs(pos_t-pos_c)<=tol and abs(pos2_t-pos2_c)<=tol
-                ) or (
-                    chrom_t==chr2_c and chr2_t==chrom_c and abs(pos_t-pos2_c)<=tol and abs(pos2_t-pos_c)<=tol
-                )
-                if ok:
-                    found=True
-            else:
-                if chrom_t==chrom_c and abs(pos_t-pos_c)<=tol and abs(end_t-end_c)<=tol:
-                    found=True
-            if found:
+            if match_one(t, c, tol):
                 used.add(id(c))
                 TP += 1
+                found=True
                 break
 
     FP = len(calls) - len(used)
@@ -553,6 +602,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 PY
 chmod +x "$EVAL"
 
