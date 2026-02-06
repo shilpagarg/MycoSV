@@ -32,6 +32,9 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <atomic>
+#include <mutex>
+#include <thread>
 
 namespace fs = std::filesystem;
 
@@ -497,6 +500,33 @@ static int compute_band_full_alignment(
 // ---------------- Affine-gap banded global alignment with correct backtrace ----------------
 struct AlnOp { char op; int len; };
 struct AlignmentResult { int score = 0; int edit = 0; std::vector<AlnOp> cigar; };
+
+static double compute_alignment_identity(
+    const std::string& ref,
+    const std::string& qry,
+    const std::vector<AlnOp>& cigar)
+{
+    uint32_t r = 0, q = 0;
+    uint64_t matches = 0;
+    uint64_t alignedM = 0;
+    const uint32_t R = (uint32_t)ref.size();
+    const uint32_t Q = (uint32_t)qry.size();
+    for (const auto& c : cigar) {
+        if (c.op == 'M') {
+            for (int k = 0; k < c.len; ++k) {
+                if (r + (uint32_t)k < R && q + (uint32_t)k < Q && ref[r+k] == qry[q+k]) matches++;
+            }
+            r += (uint32_t)c.len; q += (uint32_t)c.len; alignedM += (uint64_t)c.len;
+        } else if (c.op == 'I') {
+            q += (uint32_t)c.len;
+        } else if (c.op == 'D') {
+            r += (uint32_t)c.len;
+        }
+    }
+    if (alignedM == 0) return 0.0;
+    return (double)matches / (double)alignedM;
+}
+
 
 // Safety guard: banded DP with traceback is O(n * band) memory/time.
 // For very long sequences/windows, we fall back to anchor-splitting (below).
@@ -1010,40 +1040,114 @@ static std::vector<SVEvent> extract_svs_from_cigar(
     const std::string& ref,
     const std::string& qry,
     const std::vector<AlnOp>& cigar,
-    uint32_t sv_min_len)
+    uint32_t sv_min_len,
+    int min_flank_match,
+    int edge_exclude,
+    int max_indel_len)
 {
     std::vector<SVEvent> svs;
-    uint32_t r = 0, q = 0;
+    if (cigar.empty()) return svs;
+    const uint32_t R = (uint32_t)ref.size();
+    const uint32_t Q = (uint32_t)qry.size();
 
-    for (const auto& c : cigar) {
+    // Precompute consecutive match runs immediately before/after each CIGAR op.
+    std::vector<int> flank_before(cigar.size(), 0);
+    std::vector<int> flank_after(cigar.size(), 0);
+
+    // Pass 1: left-to-right.
+    {
+        uint32_t r = 0, q = 0;
+        int streak = 0;
+        for (size_t oi = 0; oi < cigar.size(); ++oi) {
+            flank_before[oi] = streak;
+            const auto& c = cigar[oi];
+            if (c.op == 'M') {
+                for (int k = 0; k < c.len; ++k) {
+                    if (r + (uint32_t)k < R && q + (uint32_t)k < Q && ref[r+k] == qry[q+k]) streak++;
+                    else streak = 0;
+                }
+                r += (uint32_t)c.len; q += (uint32_t)c.len;
+            } else if (c.op == 'D') {
+                r += (uint32_t)c.len; streak = 0;
+            } else if (c.op == 'I') {
+                q += (uint32_t)c.len; streak = 0;
+            }
+        }
+    }
+
+    // Pass 2: right-to-left.
+    {
+        // Compute end coordinates
+        uint32_t r_end = 0, q_end = 0;
+        for (const auto& c : cigar) {
+            if (c.op == 'M') { r_end += (uint32_t)c.len; q_end += (uint32_t)c.len; }
+            else if (c.op == 'D') r_end += (uint32_t)c.len;
+            else if (c.op == 'I') q_end += (uint32_t)c.len;
+        }
+        int streak = 0;
+        uint32_t r = r_end, q = q_end;
+        for (int oi = (int)cigar.size() - 1; oi >= 0; --oi) {
+            flank_after[(size_t)oi] = streak;
+            const auto& c = cigar[(size_t)oi];
+            if (c.op == 'M') {
+                // walk backwards over this M block
+                for (int k = c.len - 1; k >= 0; --k) {
+                    uint32_t rr = r - (uint32_t)(c.len - k);
+                    uint32_t qq = q - (uint32_t)(c.len - k);
+                    if (rr < R && qq < Q && ref[rr] == qry[qq]) streak++;
+                    else streak = 0;
+                }
+                r -= (uint32_t)c.len; q -= (uint32_t)c.len;
+            } else if (c.op == 'D') {
+                r -= (uint32_t)c.len; streak = 0;
+            } else if (c.op == 'I') {
+                q -= (uint32_t)c.len; streak = 0;
+            }
+        }
+    }
+
+    // Extract SVs.
+    uint32_t r = 0, q = 0;
+    for (size_t oi = 0; oi < cigar.size(); ++oi) {
+        const auto& c = cigar[oi];
         if (c.op == 'M') { r += (uint32_t)c.len; q += (uint32_t)c.len; }
         else if (c.op == 'D') {
-            if ((uint32_t)c.len >= sv_min_len) {
-                // Record both ref and query coordinates so we can polish/normalize later.
-                SVEvent ev;
-                ev.ref_pos = r;
-                ev.qry_pos = q;
-                ev.type = "DEL";
-                ev.allele_seq = "*";
-                ev.len = (uint32_t)c.len;
-                svs.push_back(std::move(ev));
-            }
-            r += (uint32_t)c.len;
-        } else if (c.op == 'I') {
-            if ((uint32_t)c.len >= sv_min_len) {
-                SVEvent ev;
-                ev.ref_pos = r;
-                ev.qry_pos = q;
-                ev.type = "INS";
-                ev.len = (uint32_t)c.len;
-                if ((size_t)q + (size_t)c.len <= qry.size()) {
-                    ev.allele_seq = qry.substr(q, (size_t)c.len);
-                } else {
-                    ev.allele_seq = "";
+            const uint32_t len = (uint32_t)c.len;
+            if (len >= sv_min_len && (int)len <= max_indel_len) {
+                const int L = flank_before[oi];
+                const int Rf = flank_after[oi];
+                if (L >= min_flank_match && Rf >= min_flank_match) {
+                    if (r >= (uint32_t)edge_exclude && r + len + (uint32_t)edge_exclude <= (uint32_t)ref.size()) {
+                        SVEvent ev;
+                        ev.ref_pos = r;
+                        ev.qry_pos = q;
+                        ev.type = "DEL";
+                        ev.allele_seq = "*";
+                        ev.len = len;
+                        svs.push_back(std::move(ev));
+                    }
                 }
-                svs.push_back(std::move(ev));
             }
-            q += (uint32_t)c.len;
+            r += len;
+        } else if (c.op == 'I') {
+            const uint32_t len = (uint32_t)c.len;
+            if (len >= sv_min_len && (int)len <= max_indel_len) {
+                const int L = flank_before[oi];
+                const int Rf = flank_after[oi];
+                if (L >= min_flank_match && Rf >= min_flank_match) {
+                    if (r >= (uint32_t)edge_exclude && r + (uint32_t)edge_exclude <= (uint32_t)ref.size()) {
+                        SVEvent ev;
+                        ev.ref_pos = r;
+                        ev.qry_pos = q;
+                        ev.type = "INS";
+                        ev.len = len;
+                        if ((size_t)q + (size_t)len <= qry.size()) ev.allele_seq = qry.substr(q, (size_t)len);
+                        else ev.allele_seq = "";
+                        svs.push_back(std::move(ev));
+                    }
+                }
+            }
+            q += len;
         }
     }
     return svs;
@@ -2168,6 +2272,12 @@ struct Args {
     std::string vcf_dir; // if set, write per-sample VCFs into this directory
     bool write_paths = false; // include per-sample P-lines in GFA (slow for thousands)
     int threads = 1; // sample-level parallelism (experimental)
+    // Filtering knobs to balance precision/recall
+    double min_identity = 0.80;        // minimum alignment identity for calling SVs on a contig/window
+    int min_flank_match = 60;          // minimum matched bp on BOTH sides of a CIGAR-derived indel
+    int edge_exclude = 200;            // ignore SVs within this many bp of a window edge (boundary artifacts)
+    int max_indel_len = 20000;         // drop INS/DEL bigger than this (usually mapping artifacts)
+    int max_calls_per_contig = 25;     // safety cap to avoid FP explosions in repeats
     bool oracle_truth = false;
     std::string oracle_truth_tsv; // path to truth_all.tsv
 
@@ -2261,7 +2371,13 @@ static void usage() {
         << "  --max-ref-window INT max ref window length (default 6000000; 0=unlimited)\n"
         << "  --no-recursive       do not scan subdirectories\n"
         << "  --top-contigs INT    process top N contigs per assembly file (default 50)\n"
-        << "  --min-contig INT     skip contigs shorter than this (default 1)\n";
+        << "  --min-contig INT     skip contigs shorter than this (default 1)\n"
+        << "  --threads INT        number of worker threads (default 1)\n"
+        << "  --min-identity FLOAT minimum alignment identity to emit SVs (default 0.80)\n"
+        << "  --min-flank-match INT matched bp required on each flank for CIGAR indels (default 60)\n"
+        << "  --edge-exclude INT   ignore SVs within this bp of window edges (default 200)\n"
+        << "  --max-indel-len INT  drop INS/DEL bigger than this (default 20000)\n"
+        << "  --max-calls-contig INT cap SV calls per contig (default 25)\n";
 }
 
 static Args parse_args(int argc, char** argv) {
@@ -3084,14 +3200,23 @@ int main(int argc, char** argv) {
             std::cerr << "[info] Sample " << sample << ": contigs=" << arecs.size()
                       << " processing top " << N << "\n";
 
-            int total_svs_added = 0;
+            std::atomic<int> total_svs_added{0};
 
             // Collect all calls for this sample first so we can post-process
             // them (notably, INS+DEL pairs -> TRA) before writing VCF.
             std::vector<SvCall> sample_calls;
             sample_calls.reserve((size_t)N * 16);
+            std::mutex calls_mtx;
 
-            for (int ci = 0; ci < N; ci++) {
+            std::atomic<int> next_ci{0};
+            int nthreads = std::max(1, args.threads);
+            std::vector<std::thread> workers;
+            workers.reserve((size_t)nthreads);
+            for (int ti = 0; ti < nthreads; ++ti) {
+                workers.emplace_back([&]() {
+                    while (true) {
+                        int ci = next_ci.fetch_add(1, std::memory_order_relaxed);
+                        if (ci >= N) break;
                 const auto& contig = arecs[ci];
                 if ((int)contig.seq.size() < args.min_contig_len) continue;
 
@@ -3177,8 +3302,15 @@ int main(int argc, char** argv) {
                                        ((args.max_ref_window == 0) || ((int)ref_concat.size() <= args.max_ref_window)) &&
                                        ((int)ref_concat.size() <= args.max_full_align);
 
+                // If we already chose a specific reference contig for this assembly contig,
+                // never do a full global alignment against the concatenated reference: it
+                // tanks identity and hides SVs. Prefer aligning against the chosen contig.
+                if (chosen_cid != (size_t)-1) {
+                    use_full_concat = false;
+                }
+
                 bool use_full_contig = false;
-                if (args.between_species && weak_anchoring && chosen_cid != (size_t)-1 && chosen_cid < ref_infos.size()) {
+                if (chosen_cid != (size_t)-1 && chosen_cid < ref_infos.size() && ((args.between_species && weak_anchoring) || chosen_cid != (size_t)-1)) {
                     const auto& ci = ref_infos[chosen_cid];
                     if ((int)qry_seq_full.size() <= args.max_full_align && (int)ci.len <= args.max_full_align) {
                         use_full_contig = true;
@@ -3265,6 +3397,12 @@ int main(int argc, char** argv) {
                     continue;
                 }
 
+                double aln_id = compute_alignment_identity(ref_sub, qry_sub, aln.cigar);
+                if (aln_id < args.min_identity) {
+                    std::cerr << "    [warn] Low alignment identity (" << aln_id << " < " << args.min_identity << "). Skipping SV calling for this contig.\n";
+                    continue;
+                }
+
                 if (args.debug) {
                     int maxI = 0, maxD = 0, bigI = 0, bigD = 0;
                     for (auto& c : aln.cigar) {
@@ -3283,7 +3421,7 @@ int main(int argc, char** argv) {
                                                          args.flank_anchors,
                                                          args.call_head_tail_indels);
                 auto svs_cigar  = extract_svs_from_cigar(ref_sub, qry_sub, aln.cigar,
-                                                        (uint32_t)args.sv_min_indel);
+                                                        (uint32_t)args.sv_min_indel, args.min_flank_match, args.edge_exclude, args.max_indel_len);
 
                 // Polish both to single-base breakpoints in their local windows.
                 for (auto &ev : svs_anchor) {
@@ -3383,13 +3521,13 @@ int main(int argc, char** argv) {
 
                 // Remove absurdly large indels which usually indicate a mis-mapped window.
                 svs.erase(std::remove_if(svs.begin(), svs.end(),
-                                         [&](const SVEvent& e){ return (e.type=="INS"||e.type=="DEL") && e.len > 20000; }),
+                                         [&](const SVEvent& e){ return (e.type=="INS"||e.type=="DEL") && e.len > args.max_indel_len; }),
                           svs.end());
 
-                if (svs.size() > 5) {
+                if (svs.size() > args.max_calls_per_contig) {
                     std::sort(svs.begin(), svs.end(),
                               [](const SVEvent& a, const SVEvent& b){ return a.len > b.len; });
-                    svs.resize(5);
+                    svs.resize((size_t)args.max_calls_per_contig);
                 }
 
                 std::cerr << "    [info] INS/DEL (anchor-gap) >= " << args.sv_min_indel << "bp: " << svs.size() << "\n";
@@ -3459,34 +3597,22 @@ int main(int argc, char** argv) {
                         // Keep the call even if we failed to extract the full allele sequence.
                         // The evaluator matches by coordinates only; allele is only needed for INS+DEL pairing.
                         if (c.allele_seq.empty()) c.allele_seq = "*";
-                        sample_calls.push_back(std::move(c));
-                        total_svs_added++;
+                        { std::lock_guard<std::mutex> _lk(calls_mtx); sample_calls.push_back(std::move(c)); }
+                        total_svs_added.fetch_add(1, std::memory_order_relaxed);
                     } else {
-                        // Emit directly (old behavior): VCF + graph.
-                        if (vcf_ptr) {
-                            const uint32_t pos1 = ref_local + 1;
-                            std::string id = sample + ":" + contig.name + ":" + sv_adj.type + ":" + std::to_string(pos1);
-                            std::string info = "SVTYPE=" + sv_adj.type;
-                            if (sv_adj.type == "INS") {
-                                info += ";SVLEN=" + std::to_string((int32_t)sv_adj.len) + ";END=" + std::to_string(pos1);
-                            } else {
-                                info += ";SVLEN=" + std::to_string(-(int32_t)sv_adj.len) + ";END=" + std::to_string(ref_local + sv_adj.len + 1);
-                            }
-                            if (!sv_adj.annot.empty()) info += ";ANNOT=" + sv_adj.annot;
-                            (*vcf_ptr) << ref_contig_name << '\t' << pos1 << '\t' << id << '\t' << "N" << '\t'
-                                    << "<" << sv_adj.type << ">" << '\t' << "." << '\t' << "PASS" << '\t'
-                                    << info << '\t' << "GT";
-                                                        if (per_sample_vcf) {
-                                (*vcf_ptr) << "	1";
-                            } else {
-                                for (auto& s : sample_order) (*vcf_ptr) << '	' << ((s == sample) ? "1" : "0");
-                            }
-                            (*vcf_ptr) << "\n";
-                        }
-                        if (args.graph_sv) {
-                            add_sv_to_graph(g, sample, args.write_paths, ref_contig_name, contig.name, ref_local, sv_adj, args.ref_segment);
-                        }
-                        total_svs_added++;
+                        // Thread-safe mode: collect all SVs first, then emit VCF/graph after TRA pairing.
+                        SvCall c;
+                        c.type = sv_adj.type;
+                        c.ref_contig1 = ref_contig_name;
+                        c.ref_pos = ref_local;
+                        c.len = sv_adj.len;
+                        c.annot = sv_adj.annot;
+                        c.sample = sample;
+                        c.id_hint = sample + ":" + contig.name;
+                        if (c.type == "INS") c.allele_seq = sv_adj.allele_seq;
+                        else if (c.type == "DEL") c.allele_seq = "*";
+                        { std::lock_guard<std::mutex> _lk(calls_mtx); sample_calls.push_back(std::move(c)); }
+                        total_svs_added.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
                 // --- K-mer block based complex SV discovery (INV/DUP/TRA) ---
@@ -3586,15 +3712,26 @@ std::sort(picked.begin(), picked.end(),
                             c.annot = ev.annot;
                             c.sample = sample;
                             c.id_hint = sample + ":" + contig.name;
-                            sample_calls.push_back(std::move(c));
-                            total_svs_added++;
+                            { std::lock_guard<std::mutex> _lk(calls_mtx); sample_calls.push_back(std::move(c)); }
+                            total_svs_added.fetch_add(1, std::memory_order_relaxed);
                         }
                     }
                 }
 
+                    }
+                });
             }
+            for (auto& th : workers) th.join();
 
             // Post-process: convert INS+DEL pairs into TRA (and drop those paired INS/DEL).
+            std::sort(sample_calls.begin(), sample_calls.end(),
+                      [](const SvCall& a, const SvCall& b){
+                          if (a.ref_contig1 != b.ref_contig1) return a.ref_contig1 < b.ref_contig1;
+                          if (a.ref_pos != b.ref_pos) return a.ref_pos < b.ref_pos;
+                          if (a.type != b.type) return a.type < b.type;
+                          return a.len < b.len;
+                      });
+
             convert_indel_pairs_to_tra(sample_calls,
                                        /*min_len=*/200,
                                        /*max_len=*/6000);
@@ -3645,7 +3782,7 @@ std::sort(picked.begin(), picked.end(),
                 }
             }
 
-            std::cerr << "[info] Sample " << sample << ": total SV alleles added=" << total_svs_added << "\n";
+            std::cerr << "[info] Sample " << sample << ": total SV alleles added=" << total_svs_added.load() << "\n";
         }
         if (vcf_out.is_open()) {
             vcf_out.close();
