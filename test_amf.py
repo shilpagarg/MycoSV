@@ -41,6 +41,8 @@ import random
 import re
 from dataclasses import dataclass
 from typing import Dict, List, Sequence, Tuple
+import concurrent.futures
+import threading
 
 DNA = ["A", "C", "G", "T"]
 
@@ -303,6 +305,7 @@ def main() -> None:
     ap.add_argument("--start-idx", type=int, default=0, help="start index for assembly names (useful for batching)")
     ap.add_argument("--prefix", type=str, default="asm_")
     ap.add_argument("--digits", type=int, default=4)
+    ap.add_argument("--threads", type=int, default=1, help="parallelism for per-assembly simulation (default 1)")
 
     # Truth/manifest outputs (streaming)
     ap.add_argument("--truth-all-mode", choices=["write","append","none"], default="write",
@@ -401,7 +404,28 @@ def main() -> None:
         if m: num = int(m.group(1))
         return (contig, num, rest)
 
-    for i in range(args.start_idx, args.start_idx + args.n_genomes):
+    io_lock = threading.Lock()
+    eid_lock = threading.Lock()
+    eid = 1
+
+    def next_eid() -> int:
+        nonlocal eid
+        with eid_lock:
+            x = eid
+            eid += 1
+            return x
+
+    def sort_key(tok: str):
+        contig, rest = tok.split(":", 1)
+        num = 0
+        m = re.search(r"(\d+)", rest)
+        if m: num = int(m.group(1))
+        return (contig, num, rest)
+
+    def _run_one(i: int) -> None:
+        # Use a per-assembly RNG for determinism + thread safety
+        lrng = random.Random(args.seed + i * 1000003)
+
         asm_name = f"{args.prefix}{i:0{args.digits}d}"
 
         # Working copy per genome
@@ -419,12 +443,12 @@ def main() -> None:
         posbags = {"INS":[], "DEL":[], "DUP":[], "INV":[], "TRA":[]}
 
         def emit(ev: Event):
-            nonlocal eid
-            # already has eid set by caller
-            if truth_all_fh is not None:
-                _write_truth_event(truth_all_fh, ev)
-            if per_truth_fh is not None:
-                _write_truth_event(per_truth_fh, ev)
+            # All shared-file writes must be locked (truth_all_fh / manifest_fh)
+            with io_lock:
+                if truth_all_fh is not None:
+                    _write_truth_event(truth_all_fh, ev)
+                if per_truth_fh is not None:
+                    _write_truth_event(per_truth_fh, ev)
 
             if ev.kind in counts:
                 counts[ev.kind] += 1
@@ -442,72 +466,67 @@ def main() -> None:
 
         # Apply DUP/INV/TRA first (avoid nested composition)
         for _ in range(args.dup):
-            c = rng.choice(contig_names)
+            c = lrng.choice(contig_names)
             clen = len(contigs[c])
             if clen < args.seg_len_min + 10:
                 continue
-            L = rng.randint(args.seg_len_min, min(args.seg_len_max, clen - 1))
-            s0 = pick_hotspot_pos(rng, clen - L, args.subtel_frac)
+            L = lrng.randint(args.seg_len_min, min(args.seg_len_max, clen - 1))
+            s0 = pick_hotspot_pos(lrng, clen - L, args.subtel_frac)
             s0 = min(s0, clen - L)
             s1 = s0 + L
-            if rng.random() < 0.60:
-                target = min(clen, s1 + rng.randint(0, 2000))
+            if lrng.random() < 0.60:
+                target = min(clen, s1 + lrng.randint(0, 2000))
             else:
-                target = rng.randint(0, clen)
+                target = lrng.randint(0, clen)
             apply_dup(contigs, c, s0, s1, target)
-            emit(Event(asm=asm_name, eid=eid, kind="DUP", contig=c, start=s0, end=s1, target=target, length=L,
+            emit(Event(asm=asm_name, eid=next_eid(), kind="DUP", contig=c, start=s0, end=s1, target=target, length=L,
                        extra="mode=tandem" if target >= s1 and target <= s1+2000 else "mode=dispersed"))
-            eid += 1
 
         for _ in range(args.inv):
-            c = rng.choice(contig_names)
+            c = lrng.choice(contig_names)
             clen = len(contigs[c])
             if clen < args.seg_len_min + 10:
                 continue
-            L = rng.randint(args.seg_len_min, min(args.seg_len_max, clen - 1))
-            s0 = pick_hotspot_pos(rng, clen - L, args.subtel_frac)
+            L = lrng.randint(args.seg_len_min, min(args.seg_len_max, clen - 1))
+            s0 = pick_hotspot_pos(lrng, clen - L, args.subtel_frac)
             s0 = min(s0, clen - L)
             s1 = s0 + L
             apply_inv(contigs, c, s0, s1)
-            emit(Event(asm=asm_name, eid=eid, kind="INV", contig=c, start=s0, end=s1, length=L, extra=""))
-            eid += 1
+            emit(Event(asm=asm_name, eid=next_eid(), kind="INV", contig=c, start=s0, end=s1, length=L, extra=""))
 
         for _ in range(args.tra):
-            c_src = rng.choice(contig_names)
-            c_tgt = rng.choice(contig_names)
+            c_src = lrng.choice(contig_names)
+            c_tgt = lrng.choice(contig_names)
             src_len = len(contigs[c_src])
             if src_len < args.seg_len_min + 10:
                 continue
-            L = rng.randint(args.seg_len_min, min(args.seg_len_max, src_len - 1))
-            s0 = pick_hotspot_pos(rng, src_len - L, args.subtel_frac)
+            L = lrng.randint(args.seg_len_min, min(args.seg_len_max, src_len - 1))
+            s0 = pick_hotspot_pos(lrng, src_len - L, args.subtel_frac)
             s0 = min(s0, src_len - L)
             s1 = s0 + L
             tgt_len = len(contigs[c_tgt])
-            target = pick_hotspot_pos(rng, tgt_len, args.subtel_frac)
+            target = pick_hotspot_pos(lrng, tgt_len, args.subtel_frac)
             apply_tra(contigs, c_src, s0, s1, c_tgt, target)
-            emit(Event(asm=asm_name, eid=eid, kind="TRA", contig=c_src, start=s0, end=s1,
+            emit(Event(asm=asm_name, eid=next_eid(), kind="TRA", contig=c_src, start=s0, end=s1,
                        target_contig=c_tgt, target=target, length=L, extra=""))
-            eid += 1
 
         # INS/DEL after
         for _ in range(args.ins):
-            c = rng.choice(contig_names)
-            pos = pick_hotspot_pos(rng, len(contigs[c]), args.subtel_frac)
-            L = rng.randint(args.ins_len_min, args.ins_len_max)
-            ins = random_dna(rng, L, gc=args.gc)
+            c = lrng.choice(contig_names)
+            pos = pick_hotspot_pos(lrng, len(contigs[c]), args.subtel_frac)
+            L = lrng.randint(args.ins_len_min, args.ins_len_max)
+            ins = random_dna(lrng, L, gc=args.gc)
             apply_ins(contigs, c, pos, ins)
-            emit(Event(asm=asm_name, eid=eid, kind="INS", contig=c, pos=pos, length=L,
+            emit(Event(asm=asm_name, eid=next_eid(), kind="INS", contig=c, pos=pos, length=L,
                        extra="hotspot=subtel" if pos < int(len(contigs[c])*args.subtel_frac) or pos > int(len(contigs[c])*(1-args.subtel_frac)) else "hotspot=any"))
-            eid += 1
 
         for _ in range(args.dels):
-            c = rng.choice(contig_names)
-            pos = pick_hotspot_pos(rng, len(contigs[c]), args.subtel_frac)
-            L = rng.randint(args.del_len_min, args.del_len_max)
+            c = lrng.choice(contig_names)
+            pos = pick_hotspot_pos(lrng, len(contigs[c]), args.subtel_frac)
+            L = lrng.randint(args.del_len_min, args.del_len_max)
             dl = apply_del(contigs, c, pos, L)
-            emit(Event(asm=asm_name, eid=eid, kind="DEL", contig=c, pos=pos, length=dl,
+            emit(Event(asm=asm_name, eid=next_eid(), kind="DEL", contig=c, pos=pos, length=dl,
                        extra="hotspot=subtel" if pos < int(len(contigs[c])*args.subtel_frac) or pos > int(len(contigs[c])*(1-args.subtel_frac)) else "hotspot=any"))
-            eid += 1
 
         # Write assembly as multi-contig FASTA
         asm_contigs = [(c, contigs[c]) for c in contig_names]
@@ -517,22 +536,59 @@ def main() -> None:
         if per_truth_fh is not None:
             per_truth_fh.close()
 
-        # Stream manifest row
+        # Stream manifest line (if enabled)
         if manifest_fh is not None:
-            total = sum(counts.values())
-            row = [
-                asm_name,
-                os.path.join(outdir_abs, f"{asm_name}.fa"),
-                ref_abs,
-                os.path.join(outdir_abs, f"{asm_name}.truth.tsv") if args.per_asm_truth else "",
-                truth_all_abs,
-                str(counts["INS"]), str(counts["DEL"]), str(counts["DUP"]), str(counts["INV"]), str(counts["TRA"]), str(total),
-            ]
-            if args.manifest_positions:
-                def join_list(xs):
-                    return ";".join(sorted(xs, key=sort_key))
-                row += [join_list(posbags["INS"]), join_list(posbags["DEL"]), join_list(posbags["DUP"]), join_list(posbags["INV"]), join_list(posbags["TRA"])]
-            manifest_fh.write("\t".join(row) + "\n")
+            with io_lock:
+                cols = [
+                    asm_name,
+                    os.path.join(outdir_abs, f"{asm_name}.fa"),
+                    ref_abs,
+                    os.path.join(outdir_abs, f"{asm_name}.truth.tsv") if args.per_asm_truth else "",
+                    truth_all_abs,
+                    str(counts["INS"]), str(counts["DEL"]), str(counts["DUP"]), str(counts["INV"]), str(counts["TRA"]),
+                    str(sum(counts.values()))
+                ]
+                if args.manifest_positions:
+                    for k in ["INS","DEL","DUP","INV","TRA"]:
+                        posbags[k].sort(key=sort_key)
+                    cols += [
+                        ",".join(posbags["INS"]),
+                        ",".join(posbags["DEL"]),
+                        ",".join(posbags["DUP"]),
+                        ",".join(posbags["INV"]),
+                        ",".join(posbags["TRA"]),
+                    ]
+                manifest_fh.write("\t".join(cols) + "\n")
+    
+            if per_truth_fh is not None:
+                per_truth_fh.close()
+    
+            # Stream manifest row
+            if manifest_fh is not None:
+                total = sum(counts.values())
+                row = [
+                    asm_name,
+                    os.path.join(outdir_abs, f"{asm_name}.fa"),
+                    ref_abs,
+                    os.path.join(outdir_abs, f"{asm_name}.truth.tsv") if args.per_asm_truth else "",
+                    truth_all_abs,
+                    str(counts["INS"]), str(counts["DEL"]), str(counts["DUP"]), str(counts["INV"]), str(counts["TRA"]), str(total),
+                ]
+                if args.manifest_positions:
+                    def join_list(xs):
+                        return ";".join(sorted(xs, key=sort_key))
+                    row += [join_list(posbags["INS"]), join_list(posbags["DEL"]), join_list(posbags["DUP"]), join_list(posbags["INV"]), join_list(posbags["TRA"])]
+                with io_lock:
+                    manifest_fh.write("\t".join(row) + "\n")
+    
+
+    idxs = list(range(args.start_idx, args.start_idx + args.n_genomes))
+    if args.threads <= 1:
+        for i in idxs:
+            _run_one(i)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as ex:
+            list(ex.map(_run_one, idxs))
 
     if truth_all_fh is not None:
         truth_all_fh.close()
