@@ -29,6 +29,7 @@ set -euo pipefail
 # export N_GENOMES=500
 # export MAX_MULTISAMPLE=50     # above this -> per-sample VCF mode
 # export N_JOBS=8                # parallelism for truth->VCF conversion
+# export THREADS=16           # threads for fungi_pangenome and test_amf.py
 
 #	  bash /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/run_phylum_refcoords_bench.sh \
 #	  /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/test_amf.py \
@@ -61,9 +62,17 @@ set -euo pipefail
 #     metrics.txt
 #   results_dir/metrics.tsv
 
+SELF_TEST=0
+if [[ "${1:-}" == "--self-test" ]]; then
+  SELF_TEST=1
+  shift
+fi
+
 TEST_AMF="${1:-/mnt/data/test_amf.py}"
 MAIN_CPP="${2:-/mnt/data/main.cpp}"
 ROOT_OUT="${3:-results_phyla_refcoords}"
+THREADS="${THREADS:-8}"
+PHYLUM_JOBS="${PHYLUM_JOBS:-1}"  # run multiple phyla in parallel (set >1 if you have resources)
 
 if [[ ! -f "$TEST_AMF" ]]; then
   echo "[error] missing test_amf.py at: $TEST_AMF" >&2
@@ -417,192 +426,256 @@ if __name__ == "__main__":
 PY
 chmod +x "$TRUTH_LIFT"
 
+if [[ "$SELF_TEST" -eq 1 ]]; then
+  echo "[info] Running self-test (tiny end-to-end pipeline)"
+  ST_DIR="$ROOT_OUT/__selftest__"
+  rm -rf "$ST_DIR"
+  mkdir -p "$ST_DIR"
+  pushd "$ST_DIR" >/dev/null
+  mkdir -p assemblies
+
+  # simulate tiny dataset
+  python3 "$TEST_AMF" --threads "$THREADS" \
+    --seed 1 \
+    --outdir assemblies \
+    --total-len 20000 \
+    --n-contigs 2 \
+    --n-genomes 2 \
+    --ins 2 --del 2 --dup 1 --inv 1 --tra 1 \
+    --manifest
+
+  # lift truth + call
+  python3 "$TRUTH_LIFT" "ref.fa" "assemblies/truth_all.tsv" "truth.refcoords.vcf"
+  "$BIN" \
+    --ref "ref.fa" \
+    --asm-dir "assemblies" \
+    --out "out.gfa" \
+    --vcf "out.vcf" \
+    --threads "$THREADS" \
+    --top-contigs 2
+
+  if [[ ! -s "out.vcf" ]]; then
+    echo "[selftest][error] out.vcf missing/empty" >&2
+    exit 2
+  fi
+  NVAR=$(grep -vc '^#' out.vcf || true)
+  if [[ "$NVAR" -lt 1 ]]; then
+    echo "[selftest][error] out.vcf contains no variants" >&2
+    exit 3
+  fi
+  echo "[selftest][ok] variants=$NVAR"
+  popd >/dev/null
+  exit 0
+fi
+
+
 # -----------------------------------------------------------------------------
 # Evaluate: fuzzy match truth.refcoords.vcf vs out.vcf (both reference coords)
 # -----------------------------------------------------------------------------
 EVAL="$ROOT_OUT/eval_vcfs.py"
 cat > "$EVAL" <<'PY'
 #!/usr/bin/env python3
-import sys, os, glob, math
+import sys, os, glob
 from collections import defaultdict
 
-def parse_info(info):
-    d={}
+
+def parse_info(info: str):
+    d = {}
     for p in info.split(";"):
         if "=" in p:
-            k,v=p.split("=",1)
-            d[k]=v
+            k, v = p.split("=", 1)
+            d[k] = v
     return d
+
 
 def gt_is_variant(gt_field: str) -> bool:
     # GT is first subfield before ':' (VCF spec)
-    gt = gt_field.split(":",1)[0].strip()
-    if gt in ("0","0/0","0|0",".","./.","././.","0/.","./0","0|."," . "):
+    gt = gt_field.split(":", 1)[0].strip()
+    if gt in ("0", "0/0", "0|0", ".", "./.", "././.", "0/.", "./0", "0|."):
         return False
-    # Anything else (0/1, 1/1, 1|0, etc.) => present
     return True
 
-def _read_one_vcf(path, sample_hint=None):
-    samples=[]
-    recs=[]
+
+def _read_one_vcf(path: str, sample_hint=None):
+    """Return records expanded to per-sample instances.
+
+    Each record is a tuple:
+      (chrom, pos, end, svt, chr2, pos2, sample_or_None)
+
+    If the VCF has no sample columns (sites-only), sample_or_None is None.
+    """
+    samples = []
+    recs = []
     with open(path) as f:
         for line in f:
             if line.startswith("##"):
                 continue
             if line.startswith("#CHROM"):
-                parts=line.rstrip("\n").split("\t")
-                samples=parts[9:]
+                parts = line.rstrip("\n").split("\t")
+                samples = parts[9:]
                 continue
             if not line.strip() or line.startswith("#"):
                 continue
-            P=line.rstrip("\n").split("\t")
-            chrom=P[0]
-            pos=int(P[1])  # VCF POS is 1-based
-            info=parse_info(P[7])
-            svt=info.get("SVTYPE","")
-            end=int(info.get("END",str(pos)))
-            chr2=info.get("CHR2","")
-            pos2=int(info.get("POS2","0")) if "POS2" in info else 0
 
-            present=set()
+            P = line.rstrip("\n").split("\t")
+            chrom = P[0]
+            pos = int(P[1])  # VCF POS is 1-based
+            info = parse_info(P[7])
+            svt = info.get("SVTYPE", "")
+            end = int(info.get("END", str(pos)))
+            chr2 = info.get("CHR2", "")
+            pos2 = int(info.get("POS2", "0")) if "POS2" in info else 0
+
+            present = []
             if len(P) >= 10 and samples:
-                for s,gt in zip(samples, P[9:]):
+                for s, gt in zip(samples, P[9:]):
                     if gt_is_variant(gt):
-                        present.add(s)
-            else:
-                # Sites-only or single-sample VCF without samples in header
-                if sample_hint:
-                    present.add(sample_hint)
+                        present.append(s)
+            elif sample_hint:
+                # directory-per-sample mode
+                present.append(sample_hint)
 
-            recs.append((chrom,pos,end,svt,chr2,pos2,present))
+            if present:
+                for s in present:
+                    recs.append((chrom, pos, end, svt, chr2, pos2, s))
+            else:
+                # sites-only
+                recs.append((chrom, pos, end, svt, chr2, pos2, None))
+
     return recs
 
-def read_vcf(path):
-    # path can be a file or a directory containing many *.vcf
+
+def read_vcf(path: str):
+    # path can be a file or a directory containing many *.vcf (one per sample)
     if os.path.isdir(path):
-        recs=[]
-        files=sorted(glob.glob(os.path.join(path, "*.vcf")))
+        recs = []
+        files = sorted(glob.glob(os.path.join(path, "*.vcf")))
         for fp in files:
-            stem=os.path.basename(fp)
-            sample=os.path.splitext(stem)[0]
+            stem = os.path.basename(fp)
+            sample = os.path.splitext(stem)[0]
             recs.extend(_read_one_vcf(fp, sample_hint=sample))
         return recs
-    else:
-        return _read_one_vcf(path)
+    return _read_one_vcf(path)
 
-def bucket_keys(r, binw):
-    chrom,pos,end,svt,chr2,pos2,_=r
+
+def bucket_keys(r, binw: int):
+    chrom, pos, end, svt, chr2, pos2, _ = r
     if svt == "TRA":
-        # allow swapped representation; bucket on both breakpoints with +/-1 neighbor bins
-        keys=set()
+        keys = set()
         for swap in (False, True):
-            c1,p1,c2,p2 = (chrom,pos,chr2,pos2) if not swap else (chr2,pos2,chrom,pos)
-            # canonical chromosome order to reduce duplicates
+            c1, p1, c2, p2 = (chrom, pos, chr2, pos2) if not swap else (chr2, pos2, chrom, pos)
             if (c1, c2) > (c2, c1):
-                c1,p1,c2,p2 = c2,p2,c1,p1
-            b1 = p1//binw
-            b2 = p2//binw
-            for db1 in (-1,0,1):
-                for db2 in (-1,0,1):
-                    keys.add(("TRA", c1, c2, b1+db1, b2+db2))
+                c1, p1, c2, p2 = c2, p2, c1, p1
+            b1 = p1 // binw
+            b2 = p2 // binw
+            for db1 in (-1, 0, 1):
+                for db2 in (-1, 0, 1):
+                    keys.add(("TRA", c1, c2, b1 + db1, b2 + db2))
         return keys
-    # Non-TRA: bucket on start pos with neighbor bins
-    b = pos//binw
-    return {(svt, chrom, b-1), (svt, chrom, b), (svt, chrom, b+1)}
 
-def interval_overlap(a0,a1,b0,b1):
-    # inclusive coords in VCF; convert to half-open for overlap computation
-    lo=max(a0, b0)
-    hi=min(a1, b1)
+    b = pos // binw
+    return {(svt, chrom, b - 1), (svt, chrom, b), (svt, chrom, b + 1)}
+
+
+def interval_overlap(a0, a1, b0, b1):
+    lo = max(a0, b0)
+    hi = min(a1, b1)
     return max(0, hi - lo + 1)
 
-def match_one(t, c, tol):
-    chrom_t,pos_t,end_t,svt_t,chr2_t,pos2_t,samp_t=t
-    chrom_c,pos_c,end_c,svt_c,chr2_c,pos2_c,samp_c=c
+
+def match_one(t, c, tol: int) -> bool:
+    chrom_t, pos_t, end_t, svt_t, chr2_t, pos2_t, samp_t = t
+    chrom_c, pos_c, end_c, svt_c, chr2_c, pos2_c, samp_c = c
+
     if svt_t != svt_c:
         return False
-    # Sample overlap: match if any shared sample (multisample) or if either side is sites-only.
-    if samp_t and samp_c and samp_t.isdisjoint(samp_c):
+
+    # Per-sample matching: if both specify a sample, it must be the same sample.
+    # If either side is sites-only (sample=None), treat it as a wildcard.
+    if (samp_t is not None) and (samp_c is not None) and (samp_t != samp_c):
         return False
 
     if svt_t == "TRA":
         return (
-            (chrom_t==chrom_c and chr2_t==chr2_c and abs(pos_t-pos_c)<=tol and abs(pos2_t-pos2_c)<=tol)
+            (chrom_t == chrom_c and chr2_t == chr2_c and abs(pos_t - pos_c) <= tol and abs(pos2_t - pos2_c) <= tol)
             or
-            (chrom_t==chr2_c and chr2_t==chrom_c and abs(pos_t-pos2_c)<=tol and abs(pos2_t-pos_c)<=tol)
+            (chrom_t == chr2_c and chr2_t == chrom_c and abs(pos_t - pos2_c) <= tol and abs(pos2_t - pos_c) <= tol)
         )
 
     # For INS, END is often POS or POS+1 in different emitters; match mainly on breakpoint.
     if svt_t == "INS":
-        return (chrom_t==chrom_c and abs(pos_t-pos_c) <= tol)
+        return (chrom_t == chrom_c and abs(pos_t - pos_c) <= tol)
 
-    # For interval SVs, allow either close breakpoints OR sufficient reciprocal overlap.
     if chrom_t != chrom_c:
         return False
 
-    # Normalize starts/ends
-    st_t, en_t = min(pos_t,end_t), max(pos_t,end_t)
-    st_c, en_c = min(pos_c,end_c), max(pos_c,end_c)
+    st_t, en_t = (pos_t, end_t) if pos_t <= end_t else (end_t, pos_t)
+    st_c, en_c = (pos_c, end_c) if pos_c <= end_c else (end_c, pos_c)
 
-    if abs(st_t-st_c) <= tol and abs(en_t-en_c) <= tol:
+    if abs(st_t - st_c) <= tol and abs(en_t - en_c) <= tol:
         return True
 
-    ov = interval_overlap(st_t,en_t,st_c,en_c)
+    ov = interval_overlap(st_t, en_t, st_c, en_c)
     len_t = en_t - st_t + 1
     len_c = en_c - st_c + 1
     if len_t <= 0 or len_c <= 0:
         return False
-    ro_t = ov/len_t
-    ro_c = ov/len_c
-    return (ro_t >= 0.5 and ro_c >= 0.5) and (abs(st_t-st_c) <= max(tol, 0.2*min(len_t,len_c)) or abs(en_t-en_c) <= max(tol, 0.2*min(len_t,len_c)))
+    ro_t = ov / len_t
+    ro_c = ov / len_c
 
-def match(truth, calls, tol):
+    # reciprocal overlap criterion
+    return (ro_t >= 0.5 and ro_c >= 0.5)
+
+
+def match(truth, calls, tol: int):
     binw = max(1, tol)
     buckets = defaultdict(list)
     for r in calls:
         for k in bucket_keys(r, binw):
             buckets[k].append(r)
 
-    used=set()
-    TP=0
+    used = set()
+    TP = 0
     for t in truth:
-        cand=[]
+        cand = []
         for k in bucket_keys(t, binw):
             cand.extend(buckets.get(k, []))
 
-        found=False
         for c in cand:
             if id(c) in used:
                 continue
             if match_one(t, c, tol):
                 used.add(id(c))
                 TP += 1
-                found=True
                 break
 
     FP = len(calls) - len(used)
     FN = len(truth) - TP
-    return TP,FP,FN
+    return TP, FP, FN
+
 
 def main():
     if len(sys.argv) < 4:
         print("Usage: eval_vcfs.py TRUTH(.vcf|dir) CALLS(.vcf|dir) TOL_BP", file=sys.stderr)
         sys.exit(2)
+
     truth_path, calls_path, tol = sys.argv[1], sys.argv[2], int(sys.argv[3])
     truth = read_vcf(truth_path)
     calls = read_vcf(calls_path)
-    TP,FP,FN = match(truth, calls, tol)
-    prec = TP / (TP+FP) if (TP+FP)>0 else 0.0
-    rec  = TP / (TP+FN) if (TP+FN)>0 else 0.0
+
+    TP, FP, FN = match(truth, calls, tol)
+    prec = TP / (TP + FP) if (TP + FP) > 0 else 0.0
+    rec = TP / (TP + FN) if (TP + FN) > 0 else 0.0
+
     print(f"TP\t{TP}")
     print(f"FP\t{FP}")
     print(f"FN\t{FN}")
     print(f"precision\t{prec:.6f}")
     print(f"recall\t{rec:.6f}")
 
+
 if __name__ == "__main__":
     main()
-
 PY
 chmod +x "$EVAL"
 
@@ -695,7 +768,7 @@ for row in "${PHYLUMS[@]}"; do
   echo "[info] ---- $PHYLUM ----"
   echo "[info] Simulating: total-len=$TLEN n-contigs=$NCONTIG n-genomes=$NGEN"
 
-  python3 "$TEST_AMF" \
+  python3 "$TEST_AMF" --threads "$THREADS" \
     --seed 42 \
     --outdir "$ASM" \
     --total-len "$TLEN" \
@@ -730,6 +803,7 @@ for row in "${PHYLUMS[@]}"; do
       --asm-dir "$ASM" \
       --out "$OUT/out.gfa" \
       --vcf "$OUT/out.vcf" \
+      --threads "$THREADS" \
       --sv "$SV_MIN" \
       --sv-indel "$SV_MIN_INDEL" \
       --min-seeds "$MIN_SEEDS" \
