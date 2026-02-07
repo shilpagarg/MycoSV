@@ -395,15 +395,6 @@ def main() -> None:
     ref_abs = os.path.abspath(args.ref_out)
     truth_all_abs = os.path.abspath(truth_all_path) if args.truth_all_mode != "none" else ""
 
-    eid = 1
-
-    def sort_key(tok: str):
-        contig, rest = tok.split(":", 1)
-        num = 0
-        m = re.search(r"(\d+)", rest)
-        if m: num = int(m.group(1))
-        return (contig, num, rest)
-
     io_lock = threading.Lock()
     eid_lock = threading.Lock()
     eid = 1
@@ -443,12 +434,12 @@ def main() -> None:
         posbags = {"INS":[], "DEL":[], "DUP":[], "INV":[], "TRA":[]}
 
         def emit(ev: Event):
-            # All shared-file writes must be locked (truth_all_fh / manifest_fh)
-            with io_lock:
-                if truth_all_fh is not None:
+            # Write truth (truth_all.tsv is shared across threads; per-assembly truth is private)
+            if per_truth_fh is not None:
+                _write_truth_event(per_truth_fh, ev)
+            if truth_all_fh is not None:
+                with io_lock:
                     _write_truth_event(truth_all_fh, ev)
-                if per_truth_fh is not None:
-                    _write_truth_event(per_truth_fh, ev)
 
             if ev.kind in counts:
                 counts[ev.kind] += 1
@@ -559,27 +550,6 @@ def main() -> None:
                         ",".join(posbags["TRA"]),
                     ]
                 manifest_fh.write("\t".join(cols) + "\n")
-    
-            if per_truth_fh is not None:
-                per_truth_fh.close()
-    
-            # Stream manifest row
-            if manifest_fh is not None:
-                total = sum(counts.values())
-                row = [
-                    asm_name,
-                    os.path.join(outdir_abs, f"{asm_name}.fa"),
-                    ref_abs,
-                    os.path.join(outdir_abs, f"{asm_name}.truth.tsv") if args.per_asm_truth else "",
-                    truth_all_abs,
-                    str(counts["INS"]), str(counts["DEL"]), str(counts["DUP"]), str(counts["INV"]), str(counts["TRA"]), str(total),
-                ]
-                if args.manifest_positions:
-                    def join_list(xs):
-                        return ";".join(sorted(xs, key=sort_key))
-                    row += [join_list(posbags["INS"]), join_list(posbags["DEL"]), join_list(posbags["DUP"]), join_list(posbags["INV"]), join_list(posbags["TRA"])]
-                with io_lock:
-                    manifest_fh.write("\t".join(row) + "\n")
     
 
     idxs = list(range(args.start_idx, args.start_idx + args.n_genomes))
