@@ -2273,11 +2273,11 @@ struct Args {
     bool write_paths = false; // include per-sample P-lines in GFA (slow for thousands)
     int threads = 1; // sample-level parallelism (experimental)
     // Filtering knobs to balance precision/recall
-    double min_identity = 0.80;        // minimum alignment identity for calling SVs on a contig/window
-    int min_flank_match = 60;          // minimum matched bp on BOTH sides of a CIGAR-derived indel
-    int edge_exclude = 200;            // ignore SVs within this many bp of a window edge (boundary artifacts)
+    double min_identity = 0.90;        // minimum alignment identity for calling SVs on a contig/window
+    int min_flank_match = 120;          // minimum matched bp on BOTH sides of a CIGAR-derived indel
+    int edge_exclude = 100;            // ignore SVs within this many bp of a window edge (boundary artifacts)
     int max_indel_len = 20000;         // drop INS/DEL bigger than this (usually mapping artifacts)
-    int max_calls_per_contig = 25;     // safety cap to avoid FP explosions in repeats
+    int max_calls_per_contig = 200;     // safety cap to avoid FP explosions in repeats
     bool oracle_truth = false;
     std::string oracle_truth_tsv; // path to truth_all.tsv
 
@@ -2306,7 +2306,7 @@ struct Args {
     int gap_ext  = 1;
 
     int sv_min = 50;
-    int sv_min_indel = 200; // minimum INS/DEL length (reduces overcalling)
+    int sv_min_indel = 80; // minimum INS/DEL length (reduces overcalling)
     int polish_window = 200; // bp window for base-resolution INS/DEL polishing
     // The benchmark's contigs (and divergent fungal mappings) can have sparse anchors.
     // Keep flank requirements modest to avoid dropping true indels.
