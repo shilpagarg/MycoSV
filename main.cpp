@@ -945,6 +945,10 @@ struct SvCall {
 };
 
 
+// Forward declarations for indel normalization helpers (implemented later).
+static inline void normalize_indel_left(const std::string& ref, const std::string& qry, SVEvent& ev);
+static inline double indel_flank_identity_min(const std::string& ref, const std::string& qry, const SVEvent& ev, uint32_t flank);
+
 // Simple low-complexity detector to suppress spurious indels in highly repetitive windows.
 // Returns true if the window is dominated by a single base or has very low 3-mer diversity.
 static inline bool is_low_complexity_window(const std::string& s) {
@@ -1124,7 +1128,11 @@ static std::vector<SVEvent> extract_svs_from_cigar(
                         ev.type = "DEL";
                         ev.allele_seq = "*";
                         ev.len = len;
-                        svs.push_back(std::move(ev));
+                        // Breakpoint normalization + flank-identity gate to suppress repeat-driven drift
+                        normalize_indel_left(ref, qry, ev);
+                        if (indel_flank_identity_min(ref, qry, ev, (uint32_t)min_flank_match) >= 0.90) {
+                            svs.push_back(std::move(ev));
+                        }
                     }
                 }
             }
@@ -1143,7 +1151,10 @@ static std::vector<SVEvent> extract_svs_from_cigar(
                         ev.len = len;
                         if ((size_t)q + (size_t)len <= qry.size()) ev.allele_seq = qry.substr(q, (size_t)len);
                         else ev.allele_seq = "";
-                        svs.push_back(std::move(ev));
+                        normalize_indel_left(ref, qry, ev);
+                        if (indel_flank_identity_min(ref, qry, ev, (uint32_t)min_flank_match) >= 0.90) {
+                            svs.push_back(std::move(ev));
+                        }
                     }
                 }
             }
@@ -1192,13 +1203,19 @@ static std::vector<SVEvent> extract_svs_from_anchors(
         if ((size_t)qpos + (size_t)len > qry_sub.size()) return;
         SVEvent ev; ev.ref_pos = ref_pos; ev.qry_pos = qpos; ev.type = "INS"; ev.len = len;
         ev.allele_seq = qry_sub.substr(qpos, (size_t)len);
-        svs.push_back(std::move(ev));
+        normalize_indel_left(ref_sub, qry_sub, ev);
+        if (indel_flank_identity_min(ref_sub, qry_sub, ev, (uint32_t)std::max(60, flank_anchors * k)) >= 0.90) {
+            svs.push_back(std::move(ev));
+        }
     };
     auto add_del = [&](uint32_t ref_pos, uint32_t qpos, uint32_t len) {
         if (len < min_sv) return;
         SVEvent ev; ev.ref_pos = ref_pos; ev.qry_pos = qpos; ev.type = "DEL"; ev.len = len;
         ev.allele_seq = "*";
-        svs.push_back(std::move(ev));
+        normalize_indel_left(ref_sub, qry_sub, ev);
+        if (indel_flank_identity_min(ref_sub, qry_sub, ev, (uint32_t)std::max(60, flank_anchors * k)) >= 0.90) {
+            svs.push_back(std::move(ev));
+        }
     };
 
     if (call_head_tail) {
@@ -1299,7 +1316,7 @@ static inline bool polish_indel_base_resolution(
             if (ev.type == "INS") {
                 int len_bonus = - (int)std::abs((int)c.len - (int)ev.len);
                 int pos_bonus = - (int)std::abs((int)((r0 + rpos) - ev.ref_pos));
-                int sc = 1000 + 5*len_bonus + pos_bonus;
+                int sc = 1000 + 20*len_bonus + pos_bonus;
                 if (sc > best_score) { best_score = sc; best_r = r0 + rpos; best_q = q0 + qpos; best_len = c.len; }
             }
             qpos += c.len;
@@ -1309,7 +1326,7 @@ static inline bool polish_indel_base_resolution(
             if (ev.type == "DEL") {
                 int len_bonus = - (int)std::abs((int)c.len - (int)ev.len);
                 int pos_bonus = - (int)std::abs((int)((r0 + rpos) - ev.ref_pos));
-                int sc = 1000 + 5*len_bonus + pos_bonus;
+                int sc = 1000 + 20*len_bonus + pos_bonus;
                 if (sc > best_score) { best_score = sc; best_r = r0 + rpos; best_q = q0 + qpos; best_len = c.len; }
             }
             rpos += c.len;
@@ -1333,6 +1350,96 @@ static inline bool polish_indel_base_resolution(
     return true;
 }
 
+
+// ---------------- Breakpoint normalization + flank identity for INS/DEL ----------------
+// Normalize an INS/DEL representation by left-aligning within microhomology.
+// This reduces breakpoint drift in repeats and improves both precision and recall.
+static inline void normalize_indel_left(const std::string& ref, const std::string& qry, SVEvent& ev) {
+    if (ev.type != "INS" && ev.type != "DEL") return;
+    uint32_t r = ev.ref_pos;
+    uint32_t q = ev.qry_pos;
+    uint32_t L = ev.len;
+    if (L == 0) return;
+
+    if (ev.type == "INS") {
+        if (ev.allele_seq.empty() || ev.allele_seq == "*") return;
+        std::string allele = ev.allele_seq;
+        // Left-align by rotating insertion sequence when possible.
+        while (r > 0 && q > 0) {
+            char prev_ref = ref[r - 1];
+            char last_ins = allele.back();
+            if (prev_ref != last_ins) break;
+            // rotate right by 1: last base becomes first
+            allele.insert(allele.begin(), allele.back());
+            allele.pop_back();
+            --r; --q;
+        }
+        ev.ref_pos = r;
+        ev.qry_pos = q;
+        ev.allele_seq = std::move(allele);
+        // len unchanged
+        return;
+    }
+
+    // DEL: left-align using reference microhomology.
+    // If the base immediately before the deletion equals the last deleted base, we can shift left.
+    while (r > 0 && q > 0) {
+        if ((size_t)r + (size_t)L > ref.size()) break;
+        char prev_ref = ref[r - 1];
+        char last_del = ref[r + L - 1];
+        if (prev_ref != last_del) break;
+        --r; --q;
+    }
+    ev.ref_pos = r;
+    ev.qry_pos = q;
+}
+
+// Compute flank identity around an INS/DEL breakpoint without full alignment.
+// Returns min(left_identity, right_identity).
+static inline double indel_flank_identity_min(
+    const std::string& ref,
+    const std::string& qry,
+    const SVEvent& ev,
+    uint32_t flank = 120)
+{
+    if (ev.type != "INS" && ev.type != "DEL") return 0.0;
+    uint32_t r = ev.ref_pos;
+    uint32_t q = ev.qry_pos;
+    uint32_t L = ev.len;
+
+    if (r == 0 || q == 0) return 0.0;
+
+    uint32_t left = std::min<uint32_t>(flank, std::min<uint32_t>(r, q));
+    if (left == 0) return 0.0;
+
+    auto frac_match = [](const std::string& a, size_t a0, const std::string& b, size_t b0, uint32_t n)->double{
+        uint32_t m = 0;
+        for (uint32_t i = 0; i < n; ++i) {
+            if (a[a0 + i] == b[b0 + i]) ++m;
+        }
+        return (double)m / (double)n;
+    };
+
+    double left_id = frac_match(ref, (size_t)(r - left), qry, (size_t)(q - left), left);
+
+    // Right flank: adjust offsets depending on INS/DEL.
+    size_t rr = (size_t)r;
+    size_t qq = (size_t)q;
+    if (ev.type == "INS") {
+        qq = (size_t)q + (size_t)L;
+    } else { // DEL
+        rr = (size_t)r + (size_t)L;
+    }
+    if (rr >= ref.size() || qq >= qry.size()) return 0.0;
+
+    uint32_t right = flank;
+    right = std::min<uint32_t>(right, (uint32_t)(ref.size() - rr));
+    right = std::min<uint32_t>(right, (uint32_t)(qry.size() - qq));
+    if (right == 0) return 0.0;
+
+    double right_id = frac_match(ref, rr, qry, qq, right);
+    return std::min(left_id, right_id);
+}
 static void dedup_ins_del(std::vector<SVEvent>& svs, uint32_t pos_tol=50, double len_tol=0.35) {
     std::vector<SVEvent> out;
     out.reserve(svs.size());
@@ -1901,13 +2008,7 @@ static std::vector<SVEvent> infer_dup_inv_tra_from_blocks(const std::string& qry
         uint32_t bp = A.r1l;
 
         // Determine if TRA-like jump
-        bool is_tra = false;
-        if (A.contig != B.contig) {
-            is_tra = true;
-        } else {
-            uint32_t jump = (B.r0l > A.r1l) ? (B.r0l - A.r1l) : (A.r1l - B.r0l);
-            if (jump >= tra_min_dist) is_tra = true;
-        }
+        bool is_tra = (A.contig != B.contig);
 
         // Determine if DUP-like: B overlaps any earlier visited interval (excluding itself)
         bool is_dup = false;
@@ -1926,6 +2027,8 @@ static std::vector<SVEvent> infer_dup_inv_tra_from_blocks(const std::string& qry
             // source to match truth's directional encoding.
             const uint32_t spanA = (A.b.q1 > A.b.q0) ? (A.b.q1 - A.b.q0) : 0;
             const uint32_t spanB = (B.b.q1 > B.b.q0) ? (B.b.q1 - B.b.q0) : 0;
+            // Gate TRA on block spans to suppress repeat-driven tiny blocks.
+            if (spanA < 200 || spanB < 200) continue;
             // Empirically, with our simulator and unique-kmer blocking, the moved (source) segment
             // tends to correspond to the *larger* of the two consecutive blocks (the inserted
             // fragment is long and clean, whereas flanking target-context blocks can be short).
@@ -2055,6 +2158,9 @@ static void convert_indel_pairs_to_tra(std::vector<SvCall>& calls,
             break;
         }
         if (best_ins == (size_t)-1) continue;
+
+        // Require cross-contig move; within-contig INS+DEL pairs are usually local repeats/DUP artifacts.
+        if (d.ref_contig1 == calls[best_ins].ref_contig1) continue;
 
         // Create TRA and mark both used.
         used[i] = 1;
@@ -3733,7 +3839,7 @@ std::sort(picked.begin(), picked.end(),
                       });
 
             convert_indel_pairs_to_tra(sample_calls,
-                                       /*min_len=*/200,
+                                       /*min_len=*/500,
                                        /*max_len=*/6000);
 
             // Now emit VCF + add to graph.
