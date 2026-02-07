@@ -35,6 +35,22 @@ set -euo pipefail
 #	  /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/test_amf.py \
 #	  /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/main.cpp \
 #	  results_big
+
+#---
+# export N_GENOMES=500
+# export THREADS=32
+# export MAX_MULTISAMPLE=50
+# export N_JOBS=8
+
+# export SV_MIN=100
+# export SV_MIN_INDEL=100
+# export MIN_SEEDS=60
+# export EDGE_EXCLUDE=100
+# export TOL_BP=5000
+# bash /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/run_phylum_refcoords_bench.sh \
+#   /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/test_amf.py \
+#  /mnt/bmh01-rds/Shilpa_Group/2024/projects/fungi/AMF/main.cpp \
+#  results_big
 #
 # Inputs:
 #   $1 = test_amf.py
@@ -68,7 +84,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   shift
 fi
 
-TEST_AMF="${1:-/mnt/data/test_amf.py}"
+TEST_AMF="${1:-/mnt/data/test_amf_updated.py}"
 MAIN_CPP="${2:-/mnt/data/main.cpp}"
 ROOT_OUT="${3:-results_phyla_refcoords}"
 THREADS="${THREADS:-8}"
@@ -89,7 +105,7 @@ mkdir -p "$ROOT_OUT"
 
 BIN="$ROOT_OUT/fungi_pangenome"
 echo "[info] Compiling $MAIN_CPP -> $BIN"
-g++ -O3 -std=c++17 -pthread "$MAIN_CPP" -o "$BIN"
+g++ -O3 -DNDEBUG -march=native -std=c++17 -pthread "$MAIN_CPP" -o "$BIN"
 
 # -----------------------------------------------------------------------------
 # truth_all.tsv -> truth.refcoords.vcf (reference coordinate space) via replay liftover
@@ -720,10 +736,10 @@ SEG_LEN_MIN=2000   # used for DUP/INV/TRA segments
 SEG_LEN_MAX=5000
 
 # Caller parameters
-MIN_SEEDS="${MIN_SEEDS:-200}"   # strong support for 500Mb genomes
 TOP_CONTIGS="${TOP_CONTIGS:-20}" # typical large-genome assemblies: ~20 contigs
-SV_MIN=500          # minimum SV size for INV/DUP (and general heuristics)
-SV_MIN_INDEL=500    # minimum INS/DEL size extracted from alignment
+MIN_SEEDS="${MIN_SEEDS:-30}"        # better recall default
+SV_MIN="${SV_MIN:-50}"              # allow <500bp SVs
+SV_MIN_INDEL="${SV_MIN_INDEL:-50}"  # allow <500bp INS/DEL
 
 # Candidate/split settings (for main_candidate_split.cpp; harmless if ignored)
 CANDIDATES=3
